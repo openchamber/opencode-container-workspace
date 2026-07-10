@@ -1,0 +1,23 @@
+{
+  "name": "@openchamber/opencode-container-workspace",
+  "version": "0.1.0",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "./src/plugin.js",
+  "exports": {
+    ".": "./src/plugin.js"
+  },
+  "scripts": {
+    "build": "node --check src/plugin.js && node --check src/providers/docker.js && node --check src/providers/kubernetes.js",
+    "type-check": "bun run build",
+    "lint": "bun run build"
+  },
+  "files": [
+    "src",
+    "package.json",
+    "README.md"
+  ]
+}
