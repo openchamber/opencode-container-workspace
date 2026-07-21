@@ -1,3 +1,4 @@
+import { canonicalWorkspaceLabelID } from './label-id.js';
 import { spawn, spawnSync } from 'node:child_process';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -77,7 +78,5 @@ export async function runJson(binary, args, options = {}) {
 }
 
 export function sanitizeLabelValue(value) {
-  return String(value ?? '')
-    .replace(/[^A-Za-z0-9_.-]/g, '-')
-    .slice(0, 63) || 'unknown';
+  return canonicalWorkspaceLabelID(value);
 }

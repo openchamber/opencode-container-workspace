@@ -1,13 +1,27 @@
 import { createDockerProvider } from './providers/docker.js';
 import { createKubernetesProvider } from './providers/kubernetes.js';
+import { createAppleContainerProvider } from './providers/apple-container.js';
 import { readPolicy } from './policy.js';
 
 export default async function openchamberWorkspacePlugin(input, options = {}) {
+  const registry = input?.experimental_workspace;
+  if (!registry || typeof registry.register !== 'function') {
+    return {
+      openchamber: {
+        secureWorkspaces: {
+          registered: false,
+          reason: 'OpenCode experimental workspace API is not available',
+        },
+      },
+    };
+  }
+
   const policy = readPolicy(options.policy ?? options);
   const sourceDirectory = input.directory;
   const providers = [
     createDockerProvider({ policy, sourceDirectory }),
     createKubernetesProvider({ policy, sourceDirectory }),
+    createAppleContainerProvider({ policy, sourceDirectory }),
   ].sort((left, right) => {
     if (left.kind === policy.defaultProvider) return -1;
     if (right.kind === policy.defaultProvider) return 1;
@@ -15,11 +29,10 @@ export default async function openchamberWorkspacePlugin(input, options = {}) {
   });
 
   for (const provider of providers) {
-    input.experimental_workspace.register(provider.kind, {
-      name: provider.kind === 'docker' ? 'Docker' : 'Kubernetes',
-      description: provider.kind === 'docker'
-        ? 'Create an isolated Docker workspace managed by OpenChamber'
-        : 'Create an isolated Kubernetes workspace managed by OpenChamber',
+    const label = providerLabel(provider.kind);
+    registry.register(provider.kind, {
+      name: label,
+      description: `Create an isolated ${label} workspace managed by OpenChamber`,
       configure(info, context) {
         return provider.configure(info, context);
       },
@@ -41,5 +54,12 @@ export default async function openchamberWorkspacePlugin(input, options = {}) {
     });
   }
 
-  return {};
+  return { openchamber: { secureWorkspaces: { registered: true } } };
+}
+
+function providerLabel(kind) {
+  if (kind === 'docker') return 'Docker';
+  if (kind === 'kubernetes') return 'Kubernetes';
+  if (kind === 'apple-container') return 'Apple Container';
+  return kind;
 }

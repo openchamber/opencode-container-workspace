@@ -1,4 +1,5 @@
 import { AUTH_HEADER, createTokenRef } from './auth.js';
+import { canonicalWorkspaceLabelID } from './label-id.js';
 import { sanitizeLabelValue } from './process.js';
 
 const WORKSPACE_DIR = '/workspace';
@@ -11,7 +12,7 @@ export function workspaceName(info, provider) {
 
 function baseLabels(info, provider) {
   return {
-    'openchamber.workspace.id': String(info.id),
+    'openchamber.workspace.id': canonicalWorkspaceLabelID(info.id),
     'openchamber.workspace.provider': provider,
     'openchamber.project.id': String(info.projectID ?? 'unknown'),
     'openchamber.managed': 'true',
@@ -20,7 +21,7 @@ function baseLabels(info, provider) {
 
 function kubernetesLabels(info, provider) {
   return {
-    'openchamber.io/workspace-id': sanitizeLabelValue(info.id),
+    'openchamber.io/workspace-id': canonicalWorkspaceLabelID(info.id),
     'openchamber.io/provider': provider,
     'openchamber.io/project-id': sanitizeLabelValue(info.projectID ?? 'unknown'),
     'openchamber.io/managed': 'true',
@@ -68,6 +69,8 @@ function summarizePolicy(policy) {
     allowedImages: policy.allowedImages,
     docker: policy.docker,
     kubernetes: policy.kubernetes,
+    appleContainer: policy.appleContainer,
+    egress: policy.egress,
     retention: policy.retention,
     secrets: { mode: policy.secrets.mode },
   };

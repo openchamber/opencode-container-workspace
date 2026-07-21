@@ -8,16 +8,26 @@
   "type": "module",
   "main": "./src/plugin.js",
   "exports": {
-    ".": "./src/plugin.js"
+    ".": "./src/plugin.js",
+    "./label-id": "./src/label-id.js",
+    "./policy": "./src/policy.js"
   },
   "scripts": {
-    "build": "node --check src/plugin.js && node --check src/providers/docker.js && node --check src/providers/kubernetes.js",
+    "build": "node --check src/plugin.js && node --check src/label-id.js && node --check src/process.js && node --check src/metadata.js && node --check src/runtime-command.js && node --check src/providers/docker.js && node --check src/providers/kubernetes.js && node --check src/providers/apple-container.js",
     "type-check": "bun run build",
-    "lint": "bun run build"
+    "lint": "bun run build",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.5",
+    "ws": "^8.18.3"
   },
   "files": [
-    "src",
+    "src/**/*.js",
+    "!src/**/*.test.js",
+    "runtime-image/**",
     "package.json",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ]
 }

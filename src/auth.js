@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { homedir } from 'node:os';
+import { canonicalWorkspaceLabelID } from './label-id.js';
 
 const STATE_DIR = join(homedir(), '.config', 'openchamber', 'workspace-plugin');
 const TOKEN_FILE = join(STATE_DIR, 'tokens.json');
@@ -9,7 +10,7 @@ const TOKEN_FILE = join(STATE_DIR, 'tokens.json');
 export const AUTH_HEADER = 'x-openchamber-workspace-token';
 
 export function createTokenRef(workspaceID) {
-  const hash = createHash('sha256').update(String(workspaceID)).digest('hex').slice(0, 24);
+  const hash = createHash('sha256').update(canonicalWorkspaceLabelID(workspaceID)).digest('hex').slice(0, 24);
   return `workspace-${hash}`;
 }
 
