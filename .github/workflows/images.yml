@@ -332,6 +332,7 @@ jobs:
             else
               docker run --platform "$platform" --rm --entrypoint node "${{ steps.candidate.outputs.reference }}" --check /app/gateway.mjs
             fi
+            docker image rm "${{ steps.candidate.outputs.reference }}"
           done
       - name: Make package public
         env:
@@ -341,8 +342,10 @@ jobs:
         run: |
           docker logout ghcr.io
           docker buildx imagetools inspect "${{ steps.candidate.outputs.reference }}"
-          docker pull --platform linux/amd64 "${{ steps.candidate.outputs.reference }}"
-          docker pull --platform linux/arm64 "${{ steps.candidate.outputs.reference }}"
+          for platform in linux/amd64 linux/arm64; do
+            docker pull --platform "$platform" "${{ steps.candidate.outputs.reference }}"
+            docker image rm "${{ steps.candidate.outputs.reference }}"
+          done
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
