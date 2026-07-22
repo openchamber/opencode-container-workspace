@@ -10,12 +10,31 @@ on:
 permissions:
   contents: read
 
+env:
+  NODE_BASE_IMAGE: node@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3
+  QEMU_IMAGE: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+  BUILDX_VERSION: v0.35.0
+  BUILDKIT_IMAGE: moby/buildkit@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+  REGISTRY_IMAGE: registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+  TRIVY_VERSION: v0.72.0
+  K3D_VERSION: v5.8.3
+  K3D_LINUX_AMD64_SHA256: dbaa79a76ace7f4ca230a1ff41dc7d8a5036a8ad0309e9c54f9bf3836dbe853e
+  K3D_TOOLS_IMAGE: ghcr.io/k3d-io/k3d-tools@sha256:c5ceb2b9e8ff2cf55917b0bee8bc9c54fe1483a16366b734117e2cfac1417bed
+  K3D_PROXY_IMAGE: ghcr.io/k3d-io/k3d-proxy@sha256:d43e6ffd27c216d0b21815c1226c8aeac2e07086ac5a988eb39bd7e308f6e370
+  K3S_IMAGE: rancher/k3s@sha256:a2920ca992f197e35812173322734207b89f73084dbe3e2404c11d582a9ecf40
+  KUBECTL_VERSION: v1.33.1
+  KUBECTL_LINUX_AMD64_SHA256: 5de4e9f2266738fd112b721265a0c1cd7f4e5208b670f811861f699474a100a3
+  INGRESS_NGINX_VERSION: controller-v1.15.1
+  INGRESS_NGINX_MANIFEST_SHA256: 502fddca66b09c20dd48b6d0a792a9671cd663a3a0d2a8bda5ae990d13b6c5b2
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
       - run: bun install --frozen-lockfile
       - run: bun run test
       - run: bun run lint
@@ -38,20 +57,19 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          image: ${{ env.QEMU_IMAGE }}
+          platforms: arm64
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Resolve immutable base image
-        id: base
-        shell: bash
-        run: |
-          digest="$(docker buildx imagetools inspect node:22-bookworm-slim --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          test -n "$digest"
-          echo "image=node@${digest}" >> "$GITHUB_OUTPUT"
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
       - name: Build multi-architecture OCI archive with SBOM and provenance
         run: |
           docker buildx build . \
             --file "${{ matrix.dockerfile }}" \
             --platform linux/amd64,linux/arm64 \
-            --build-arg "NODE_BASE_IMAGE=${{ steps.base.outputs.image }}" \
+            --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" \
             --sbom=true \
             --provenance=mode=max \
             --output "type=oci,dest=/tmp/${{ matrix.name }}.tar"
@@ -64,7 +82,7 @@ jobs:
           trap cleanup EXIT
           for platform in linux/amd64 linux/arm64; do
             arch="${platform#linux/}"
-            docker buildx build . --file "${{ matrix.dockerfile }}" --platform "$platform" --build-arg "NODE_BASE_IMAGE=${{ steps.base.outputs.image }}" --load --tag "workspace-smoke:${{ matrix.name }}-$arch"
+            docker buildx build . --file "${{ matrix.dockerfile }}" --platform "$platform" --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --load --tag "workspace-smoke:${{ matrix.name }}-$arch"
             if [ "${{ matrix.name }}" = "opencode-workspace" ]; then
               docker run --rm "workspace-smoke:${{ matrix.name }}-$arch" opencode --version
               cid="$(docker run -d -p 127.0.0.1::4096 "workspace-smoke:${{ matrix.name }}-$arch" opencode serve --hostname 0.0.0.0 --port 4096)"
@@ -94,10 +112,13 @@ jobs:
             fi
           done
       - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
       - name: Vulnerability gate
         run: |
           for platform in linux/amd64 linux/arm64; do
-            trivy image --input "/tmp/${{ matrix.name }}.tar" --platform "$platform" --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+            arch="${platform#linux/}"
+            trivy image --platform "$platform" --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "workspace-smoke:${{ matrix.name }}-$arch"
           done
 
   docker-live:
@@ -108,35 +129,139 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-      - name: Resolve immutable base image
-        id: base
-        shell: bash
-        run: |
-          digest="$(docker buildx imagetools inspect node:22-bookworm-slim --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          test -n "$digest"
-          echo "image=node@$digest" >> "$GITHUB_OUTPUT"
+        with:
+          bun-version: 1.3.14
       - run: bun install --frozen-lockfile
-      - name: Build native integration images
+      - name: Start ephemeral integration registry
+        run: docker run --detach --name workspace-integration-registry --publish 127.0.0.1:5000:5000 "$REGISTRY_IMAGE"
+      - name: Build and push native integration images
         run: |
-          docker build . --file runtime-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${{ steps.base.outputs.image }}" --tag workspace-integration/runtime:latest
-          docker build . --file egress-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${{ steps.base.outputs.image }}" --tag workspace-integration/gateway:latest
+          docker build . --file runtime-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --tag 127.0.0.1:5000/workspace-integration/runtime:ci
+          docker build . --file egress-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --tag 127.0.0.1:5000/workspace-integration/gateway:ci
+          docker push 127.0.0.1:5000/workspace-integration/runtime:ci
+          docker push 127.0.0.1:5000/workspace-integration/gateway:ci
       - name: Resolve integration image digests
         id: integration-images
         shell: bash
         run: |
-          runtime="$(docker image inspect workspace-integration/runtime:latest --format '{{.Id}}')"
-          gateway="$(docker image inspect workspace-integration/gateway:latest --format '{{.Id}}')"
-          echo "runtime=${runtime#sha256:}" >> "$GITHUB_OUTPUT"
-          echo "gateway=${gateway#sha256:}" >> "$GITHUB_OUTPUT"
+          manifest_digest() {
+            node -e "fetch('http://127.0.0.1:5000/v2/workspace-integration/$1/manifests/ci',{headers:{accept:'application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'}}).then(response=>{if(!response.ok)throw new Error('manifest request failed: '+response.status);const digest=response.headers.get('docker-content-digest');if(!digest)throw new Error('registry omitted Docker-Content-Digest');process.stdout.write(digest)})"
+          }
+          runtime="$(manifest_digest runtime)"
+          gateway="$(manifest_digest gateway)"
+          [[ "$runtime" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$gateway" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
+          echo "gateway=$gateway" >> "$GITHUB_OUTPUT"
       - name: Run live Docker provider lifecycle
         env:
-          OPENCHAMBER_DOCKER_WORKSPACE_INTEGRATION_IMAGE: workspace-integration/runtime@sha256:${{ steps.integration-images.outputs.runtime }}
-          OPENCHAMBER_DOCKER_WORKSPACE_INTEGRATION_GATEWAY_IMAGE: workspace-integration/gateway@sha256:${{ steps.integration-images.outputs.gateway }}
+          OPENCHAMBER_DOCKER_WORKSPACE_INTEGRATION_IMAGE: 127.0.0.1:5000/workspace-integration/runtime@${{ steps.integration-images.outputs.runtime }}
+          OPENCHAMBER_DOCKER_WORKSPACE_INTEGRATION_GATEWAY_IMAGE: 127.0.0.1:5000/workspace-integration/gateway@${{ steps.integration-images.outputs.gateway }}
         run: bunx vitest run src/providers/docker.integration.test.js
+      - name: Remove ephemeral integration registry
+        if: always()
+        run: docker rm --force workspace-integration-registry
+
+  kubernetes-live:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - name: Install pinned Kubernetes tools
+        run: |
+          curl --fail --location --silent --show-error "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-amd64" --output /tmp/k3d
+          echo "${K3D_LINUX_AMD64_SHA256}  /tmp/k3d" | sha256sum --check --strict
+          curl --fail --location --silent --show-error "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" --output /tmp/kubectl
+          echo "${KUBECTL_LINUX_AMD64_SHA256}  /tmp/kubectl" | sha256sum --check --strict
+          sudo install --mode 0755 /tmp/k3d /usr/local/bin/k3d
+          sudo install --mode 0755 /tmp/kubectl /usr/local/bin/kubectl
+      - name: Create pinned cluster and registry
+        run: |
+          docker pull "$K3D_TOOLS_IMAGE"
+          docker tag "$K3D_TOOLS_IMAGE" "ghcr.io/k3d-io/k3d-tools:${K3D_VERSION#v}"
+          docker pull "$K3D_PROXY_IMAGE"
+          docker tag "$K3D_PROXY_IMAGE" "ghcr.io/k3d-io/k3d-proxy:${K3D_VERSION#v}"
+          k3d registry create workspace-ci --image "$REGISTRY_IMAGE" --port 5000
+          k3d cluster create workspace-ci \
+            --image "$K3S_IMAGE" \
+            --servers 1 \
+            --agents 1 \
+            --registry-use k3d-workspace-ci:5000 \
+            --k3s-arg "--disable=traefik@server:0" \
+            --port "127.0.0.1:443:443@loadbalancer" \
+            --wait
+      - name: Build and push native integration images
+        run: |
+          docker build . --file runtime-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --tag 127.0.0.1:5000/workspace-integration/runtime:ci
+          docker build . --file egress-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --tag 127.0.0.1:5000/workspace-integration/gateway:ci
+          docker push 127.0.0.1:5000/workspace-integration/runtime:ci
+          docker push 127.0.0.1:5000/workspace-integration/gateway:ci
+      - name: Resolve integration image digests
+        id: kubernetes-images
+        shell: bash
+        run: |
+          manifest_digest() {
+            node -e "fetch('http://127.0.0.1:5000/v2/workspace-integration/$1/manifests/ci',{headers:{accept:'application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'}}).then(response=>{if(!response.ok)throw new Error('manifest request failed: '+response.status);const digest=response.headers.get('docker-content-digest');if(!digest)throw new Error('registry omitted Docker-Content-Digest');process.stdout.write(digest)})"
+          }
+          runtime="$(manifest_digest runtime)"
+          gateway="$(manifest_digest gateway)"
+          [[ "$runtime" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$gateway" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
+          echo "gateway=$gateway" >> "$GITHUB_OUTPUT"
+      - name: Install pinned ingress controller
+        run: |
+          curl --fail --location --silent --show-error "https://raw.githubusercontent.com/kubernetes/ingress-nginx/${INGRESS_NGINX_VERSION}/deploy/static/provider/cloud/deploy.yaml" --output /tmp/ingress-nginx.yaml
+          echo "${INGRESS_NGINX_MANIFEST_SHA256}  /tmp/ingress-nginx.yaml" | sha256sum --check --strict
+          kubectl apply --filename /tmp/ingress-nginx.yaml
+          kubectl wait --namespace ingress-nginx --for=condition=Available deployment/ingress-nginx-controller --timeout=180s
+      - name: Create integration namespace and TLS fixture
+        run: |
+          kubectl create namespace openchamber-workspaces
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=OpenChamber CI CA' -keyout /tmp/ca.key -out /tmp/ca.crt
+          openssl req -newkey rsa:2048 -nodes -subj '/CN=*.workspaces.127.0.0.1.nip.io' -keyout /tmp/tls.key -out /tmp/tls.csr
+          printf 'subjectAltName=DNS:*.workspaces.127.0.0.1.nip.io\n' > /tmp/tls.ext
+          openssl x509 -req -days 1 -in /tmp/tls.csr -CA /tmp/ca.crt -CAkey /tmp/ca.key -CAcreateserial -extfile /tmp/tls.ext -out /tmp/tls.crt
+          kubectl create secret tls workspace-tls --namespace openchamber-workspaces --cert /tmp/tls.crt --key /tmp/tls.key
+      - name: Run live Kubernetes port-forward lifecycle
+        env:
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_IMAGE: k3d-workspace-ci:5000/workspace-integration/runtime@${{ steps.kubernetes-images.outputs.runtime }}
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_GATEWAY_IMAGE: k3d-workspace-ci:5000/workspace-integration/gateway@${{ steps.kubernetes-images.outputs.gateway }}
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_CONTEXT: k3d-workspace-ci
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_NAMESPACE: openchamber-workspaces
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_DNS_CIDR: 10.43.0.10/32
+        run: bunx vitest run src/providers/kubernetes.integration.test.js
+      - name: Run live Kubernetes HTTPS ingress lifecycle
+        env:
+          NODE_EXTRA_CA_CERTS: /tmp/ca.crt
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_IMAGE: k3d-workspace-ci:5000/workspace-integration/runtime@${{ steps.kubernetes-images.outputs.runtime }}
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_GATEWAY_IMAGE: k3d-workspace-ci:5000/workspace-integration/gateway@${{ steps.kubernetes-images.outputs.gateway }}
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_CONTEXT: k3d-workspace-ci
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_NAMESPACE: openchamber-workspaces
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_DNS_CIDR: 10.43.0.10/32
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_CONNECTIVITY: ingress
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_CLASS: nginx
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_HOST_TEMPLATE: '{resourceID}.workspaces.127.0.0.1.nip.io'
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_TLS_SECRET: workspace-tls
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_CONTROLLER_NAMESPACE: ingress-nginx
+          OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_CONTROLLER_POD_LABEL: app.kubernetes.io/name=ingress-nginx
+        run: bunx vitest run src/providers/kubernetes.integration.test.js
+      - name: Remove integration cluster and registry
+        if: always()
+        run: |
+          k3d cluster delete workspace-ci
+          k3d registry delete workspace-ci
+          docker network rm k3d-workspace-ci 2>/dev/null || true
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, image, docker-live]
+    needs: [test, image, docker-live, kubernetes-live]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -153,15 +278,16 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          image: ${{ env.QEMU_IMAGE }}
+          platforms: arm64
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Resolve immutable base image
-        id: base
-        shell: bash
-        run: |
-          digest="$(docker buildx imagetools inspect node:22-bookworm-slim --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          test -n "$digest"
-          echo "image=node@${digest}" >> "$GITHUB_OUTPUT"
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
       - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
       - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -178,7 +304,7 @@ jobs:
           docker buildx build . \
             --file "${{ matrix.dockerfile }}" \
             --platform linux/amd64,linux/arm64 \
-            --build-arg "NODE_BASE_IMAGE=${{ steps.base.outputs.image }}" \
+            --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" \
             --sbom=true --provenance=mode=max \
             --tag "$candidate" --push --metadata-file /tmp/candidate-metadata.json
           digest="$(node -e 'const v=require("/tmp/candidate-metadata.json");process.stdout.write(v["containerimage.digest"])')"
@@ -188,7 +314,7 @@ jobs:
       - name: Vulnerability gate on exact candidate digest
         run: |
           for platform in linux/amd64 linux/arm64; do
-            trivy image "${{ steps.candidate.outputs.reference }}" --platform "$platform" --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+            trivy image --platform "$platform" --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "${{ steps.candidate.outputs.reference }}"
           done
       - name: Promote verified digest to release tag
         id: publish

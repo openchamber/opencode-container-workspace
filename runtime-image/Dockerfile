@@ -2,6 +2,7 @@ ARG NODE_BASE_IMAGE
 FROM ${NODE_BASE_IMAGE}
 
 ARG OPENCODE_VERSION=1.18.4
+ARG NPM_VERSION=12.0.1
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -10,7 +11,8 @@ RUN apt-get update \
     git \
     openssh-client \
     tar \
-  && npm install -g "opencode-ai@${OPENCODE_VERSION}" \
+  && npm install -g "npm@${NPM_VERSION}" \
+  && npm install -g --allow-scripts=opencode-ai "opencode-ai@${OPENCODE_VERSION}" \
   && npm cache clean --force \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*

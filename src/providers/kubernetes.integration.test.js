@@ -10,7 +10,14 @@ const gatewayImage = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_GA
 const context = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_CONTEXT;
 const namespace = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_NAMESPACE;
 const dnsCIDR = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_DNS_CIDR;
-const integrationIt = image && gatewayImage && context && namespace && dnsCIDR ? it : it.skip;
+const connectivity = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_CONNECTIVITY ?? 'port-forward';
+const ingressClassName = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_CLASS;
+const ingressHostTemplate = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_HOST_TEMPLATE;
+const ingressTLSSecret = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_TLS_SECRET;
+const ingressControllerNamespace = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_CONTROLLER_NAMESPACE;
+const ingressControllerPodLabel = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_CONTROLLER_POD_LABEL;
+const ingressConfigured = connectivity === 'port-forward' || (connectivity === 'ingress' && ingressClassName && ingressHostTemplate && ingressTLSSecret && ingressControllerNamespace && ingressControllerPodLabel);
+const integrationIt = image && gatewayImage && context && namespace && dnsCIDR && ingressConfigured ? it : it.skip;
 
 describe('kubernetes workspace provider integration', () => {
   integrationIt('creates, exports, reconciles, and removes an isolated workspace', async () => {
@@ -26,6 +33,17 @@ describe('kubernetes workspace provider integration', () => {
         namespace,
         allowedContexts: [context],
         allowedNamespaces: [namespace],
+        connectivity,
+        ...(connectivity === 'ingress' ? {
+          ingress: {
+            ingressClassName,
+            hostTemplate: ingressHostTemplate,
+            pathTemplate: '/',
+            tls: { mode: 'existing-secret', secretName: ingressTLSSecret },
+            controllerNamespaceSelector: { 'kubernetes.io/metadata.name': ingressControllerNamespace },
+            controllerPodSelector: parseSelector(ingressControllerPodLabel),
+          },
+        } : {}),
         storage: '64Mi',
         cpuRequest: '25m',
         memoryRequest: '128Mi',
@@ -44,6 +62,7 @@ describe('kubernetes workspace provider integration', () => {
       created = true;
       const target = await provider.target(info);
       expect((await fetch(new URL('/global/health', target.url), { headers: target.headers })).ok).toBe(true);
+      expect((await fetch(new URL('/global/health', target.url))).status).toBe(401);
 
       const mutation = spawnSync('kubectl', [
         '--context', context, 'exec', `deployment/${info.extra.resourceRefs.deployment}`, '-n', namespace, '--',
@@ -67,3 +86,9 @@ describe('kubernetes workspace provider integration', () => {
     }
   }, 600_000);
 });
+
+function parseSelector(value) {
+  const separator = value.indexOf('=');
+  if (separator <= 0 || separator === value.length - 1) throw new Error('Kubernetes integration ingress controller pod label must be key=value');
+  return { [value.slice(0, separator)]: value.slice(separator + 1) };
+}

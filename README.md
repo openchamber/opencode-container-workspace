@@ -21,7 +21,9 @@ Provider secrets and arbitrary process helpers are intentionally not exported.
 - For Docker or Apple Container, `OPENCHAMBER_WORKSPACE_STATE_DIR` must be on a host path visible to the container runtime because source archives and file-backed secrets are staged there.
 
 There is intentionally no default runtime image until a public signed multi-architecture image exists.
-Both image Dockerfiles require `NODE_BASE_IMAGE` as an immutable digest reference; the image workflow resolves and records that digest before building.
+Both image Dockerfiles require `NODE_BASE_IMAGE` as an immutable digest reference. The image workflow pins that multi-architecture digest, the Trivy version, and its ephemeral Docker registry image in source so branch and release builds do not resolve mutable tool or base-image tags.
+The Kubernetes live gate uses checksum-verified `kubectl` and k3d binaries, digest-pinned K3s and registry images, and a checksum-verified ingress-nginx manifest with digest-pinned controller images. It validates both port-forward and authenticated HTTPS ingress lifecycle paths before image publication.
+The runtime image pins npm `12.0.1` so the required package tooling does not retain the fixed HIGH/CRITICAL vulnerabilities in the base image's npm payload. The gateway has no package-management role and removes npm, Corepack, and Yarn from its final filesystem to reduce its executable and scanner surface.
 
 ## Configuration
 
