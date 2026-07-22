@@ -82,6 +82,21 @@ describe('Kubernetes provider manifests', () => {
     expect(runtimePolicy.spec.ingress[0].from[0]).toMatchObject({ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'ingress-nginx' } }, podSelector: { matchLabels: { 'app.kubernetes.io/name': 'ingress-nginx' } } });
   });
 
+  it('tracks the generated cert-manager TLS secret as a canonical resource', () => {
+    const currentPolicy = readPolicy({
+      defaultImage: 'workspace-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      egress: { mode: 'external', proxyUrl: 'http://10.0.0.10:3128', proxyCIDR: '10.0.0.10/32', dnsCIDRs: ['10.0.0.53/32'] },
+      kubernetes: { connectivity: 'ingress', ingress: { ingressClassName: 'nginx', hostTemplate: '{resourceID}.workspaces.example.com', pathTemplate: '/', tls: { mode: 'cert-manager', clusterIssuer: 'workspace-ca' }, controllerNamespaceSelector: { 'kubernetes.io/metadata.name': 'ingress-nginx' }, controllerPodSelector: { 'app.kubernetes.io/name': 'ingress-nginx' } } },
+    });
+    const identity = deriveWorkspaceIdentity({ id: 'control-id', projectID: 'project-id' }, 'kubernetes');
+    const refs = canonicalResourceRefs(identity.providerResourceID, 'kubernetes', currentPolicy);
+    const manifests = buildManifests({ identity, refs, image: currentPolicy.defaultImage, policy: currentPolicy, token: 'token' });
+    const ingress = manifests.infrastructure.find((item) => item.kind === 'Ingress');
+    expect(refs.ingressTLSSecret).toBe(`${refs.ingress}-tls`);
+    expect(ingress.spec.tls[0].secretName).toBe(refs.ingressTLSSecret);
+    expect(ingress.metadata.annotations['cert-manager.io/cluster-issuer']).toBe('workspace-ca');
+  });
+
   it('builds an isolated managed gateway and routes runtime proxy traffic only through it', () => {
     const currentPolicy = readPolicy({
       defaultImage: 'workspace-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',

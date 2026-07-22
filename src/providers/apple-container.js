@@ -1,4 +1,5 @@
 import { createServer } from 'node:net';
+import { basename, dirname } from 'node:path';
 import { commandExists, run, runJson } from '../process.js';
 import { OwnershipError, ProviderUnavailableError } from '../errors.js';
 import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
@@ -69,6 +70,7 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
       const args = [
         'run', '--detach', '--name', refs.runtime, ...labelArgs(providerLabels(identity, 'runtime')),
         '--network', refs.network, '--user', '1000:1000', '--read-only', '--cap-drop', 'ALL',
+        '--tmpfs', '/tmp',
         '--publish', `127.0.0.1:${hostPort}:${WORKSPACE_RUNTIME.port}`,
         '--volume', `${refs.mutableVolume}:${WORKSPACE_RUNTIME.directory}`,
         '--volume', `${refs.baselineVolume}:${WORKSPACE_RUNTIME.baselineDirectory}:ro`,
@@ -154,9 +156,14 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
     try {
       await verifyWorkspace(containerJson, meta);
       const state = await readOwnedState(meta);
+      const repaired = [];
+      const inspected = await containerJson(['inspect', meta.resourceRefs.runtime], { timeoutMs: 20_000 });
+      if (inspected?.[0]?.status?.state !== 'running') {
+        await container(['start', meta.resourceRefs.runtime], { timeoutMs: 60_000 });
+        repaired.push('runtime-restart');
+      }
       const remote = await target(info);
       await waitForHttpHealth(remote.url, remote.headers, { timeoutMs: 15_000 });
-      const repaired = [];
       if (state.lifecycle !== 'ready') { await writeWorkspaceState(meta.providerResourceID, { ...state, lifecycle: 'ready', reconciledAt: new Date().toISOString() }); repaired.push('operation-journal'); }
       return { provider, providerResourceID: meta.providerResourceID, status: 'ready', diagnostics: [], repaired };
     } catch (error) {
@@ -177,7 +184,7 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
 }
 
 async function seedVolume(container, image, volume, mountPath, archivePath, generation) {
-  await container(['run', '--rm', '--user', '1000:1000', '--network', 'none', '--cap-drop', 'ALL', '--volume', `${volume}:${mountPath}`, '--mount', `type=bind,source=${archivePath},target=/source.tar,readonly`, image, 'sh', '-lc', `set -eu; tar --no-same-owner -xf /source.tar -C ${mountPath}; mkdir -p ${mountPath}/.openchamber-runtime; printf '%s' '${generation}' > ${mountPath}/.openchamber-runtime/source-generation`], { timeoutMs: 300_000 });
+  await container(['run', '--rm', '--user', '0:0', '--network', 'none', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--volume', `${volume}:${mountPath}`, '--mount', `type=bind,source=${dirname(archivePath)},target=/source,readonly`, image, 'sh', '-lc', `set -eu; tar --no-same-owner -xf /source/${basename(archivePath)} -C ${mountPath}; mkdir -p ${mountPath}/.openchamber-runtime; printf '%s' '${generation}' > ${mountPath}/.openchamber-runtime/source-generation; chown -R 1000:1000 ${mountPath}`], { timeoutMs: 300_000 });
 }
 
 async function verifyAppleSeed(container, image, volume, mountPath, generation) {
@@ -191,7 +198,7 @@ async function verifyAppleSeed(container, image, volume, mountPath, generation) 
 
 async function updateSecretVolume(container, image, secretVolume, token, modelAuth) {
   const payload = JSON.stringify({ token, modelAuth });
-  await container(['run', '--rm', '-i', '--user', '1000:1000', '--network', 'none', '--cap-drop', 'ALL', '--volume', `${secretVolume}:${PROVIDER_SECRET_DIRECTORY}`, image, 'node', '-e', `const fs=require('fs');let s='';const write=(p,v)=>{try{fs.chmodSync(p,0o600)}catch(e){if(e.code!=='ENOENT')throw e}fs.writeFileSync(p,v,{mode:0o600});fs.chmodSync(p,0o400)};process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{const v=JSON.parse(s);write('${PROVIDER_TOKEN_FILE}',v.token);if(v.modelAuth===undefined)fs.rmSync('${PROVIDER_MODEL_AUTH_FILE}',{force:true});else write('${PROVIDER_MODEL_AUTH_FILE}',v.modelAuth)})`], { input: payload, timeoutMs: 60_000, sensitiveOutput: true });
+  await container(['run', '--rm', '-i', '--user', '0:0', '--network', 'none', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--volume', `${secretVolume}:${PROVIDER_SECRET_DIRECTORY}`, image, 'node', '-e', `const fs=require('fs');let s='';const write=(p,v)=>{try{fs.chmodSync(p,0o600)}catch(e){if(e.code!=='ENOENT')throw e}fs.writeFileSync(p,v,{mode:0o600});fs.chmodSync(p,0o400);fs.chownSync(p,1000,1000)};process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{const v=JSON.parse(s);write('${PROVIDER_TOKEN_FILE}',v.token);if(v.modelAuth===undefined)fs.rmSync('${PROVIDER_MODEL_AUTH_FILE}',{force:true});else write('${PROVIDER_MODEL_AUTH_FILE}',v.modelAuth);fs.chmodSync('${PROVIDER_SECRET_DIRECTORY}',0o700);fs.chownSync('${PROVIDER_SECRET_DIRECTORY}',1000,1000)})`], { input: payload, timeoutMs: 60_000, sensitiveOutput: true });
 }
 
 async function verifyWorkspace(containerJson, meta) {

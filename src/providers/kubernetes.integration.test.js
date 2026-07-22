@@ -13,10 +13,13 @@ const dnsCIDR = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_DNS_CID
 const connectivity = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_CONNECTIVITY ?? 'port-forward';
 const ingressClassName = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_CLASS;
 const ingressHostTemplate = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_HOST_TEMPLATE;
+const ingressTLSMode = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_TLS_MODE ?? 'existing-secret';
 const ingressTLSSecret = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_TLS_SECRET;
+const ingressTLSIssuer = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_TLS_ISSUER;
 const ingressControllerNamespace = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_CONTROLLER_NAMESPACE;
 const ingressControllerPodLabel = process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_INGRESS_CONTROLLER_POD_LABEL;
-const ingressConfigured = connectivity === 'port-forward' || (connectivity === 'ingress' && ingressClassName && ingressHostTemplate && ingressTLSSecret && ingressControllerNamespace && ingressControllerPodLabel);
+const ingressTLSConfigured = ingressTLSMode === 'existing-secret' ? ingressTLSSecret : ingressTLSMode === 'cert-manager' && ingressTLSIssuer;
+const ingressConfigured = connectivity === 'port-forward' || (connectivity === 'ingress' && ingressClassName && ingressHostTemplate && ingressTLSConfigured && ingressControllerNamespace && ingressControllerPodLabel);
 const integrationIt = image && gatewayImage && context && namespace && dnsCIDR && ingressConfigured ? it : it.skip;
 
 describe('kubernetes workspace provider integration', () => {
@@ -39,7 +42,9 @@ describe('kubernetes workspace provider integration', () => {
             ingressClassName,
             hostTemplate: ingressHostTemplate,
             pathTemplate: '/',
-            tls: { mode: 'existing-secret', secretName: ingressTLSSecret },
+            tls: ingressTLSMode === 'existing-secret'
+              ? { mode: ingressTLSMode, secretName: ingressTLSSecret }
+              : { mode: ingressTLSMode, clusterIssuer: ingressTLSIssuer },
             controllerNamespaceSelector: { 'kubernetes.io/metadata.name': ingressControllerNamespace },
             controllerPodSelector: parseSelector(ingressControllerPodLabel),
           },
@@ -77,6 +82,10 @@ describe('kubernetes workspace provider integration', () => {
         if (created || process.env.OPENCHAMBER_KUBERNETES_WORKSPACE_INTEGRATION_PRESERVE_ON_FAILURE !== 'true') {
           await provider.remove(info);
           cleanupCompleted = true;
+          if (info.extra.resourceRefs.ingressTLSSecret) {
+            const secret = spawnSync('kubectl', ['--context', context, 'get', 'secret', info.extra.resourceRefs.ingressTLSSecret, '-n', namespace], { encoding: 'utf8', windowsHide: true });
+            expect(secret.status).not.toBe(0);
+          }
         }
       } finally {
         delete process.env.OPENCHAMBER_WORKSPACE_STATE_DIR;

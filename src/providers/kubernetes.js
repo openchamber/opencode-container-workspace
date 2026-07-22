@@ -68,8 +68,12 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
       const manifests = buildManifests({ identity, refs, image, policy, token: secrets.token, modelAuth: secrets.modelAuth });
       for (const manifest of manifests.infrastructure) {
         const resource = `${manifest.kind.toLowerCase()}:${manifest.metadata.name}`;
-        await transaction.create(resource, () => createManifest(kubectl, manifest), () => deleteResource(kubectl, manifest.kind, manifest.metadata.name, refs.namespace), () => resourceExistsOwned(kubectl, manifest.kind, manifest.metadata.name, refs.namespace, manifest.metadata.labels));
+        await transaction.create(resource, () => createManifest(kubectl, manifest), async () => {
+          await deleteResource(kubectl, manifest.kind, manifest.metadata.name, refs.namespace);
+          if (manifest.kind === 'Ingress' && refs.ingressTLSSecret) await deleteCertManagerTLSSecret(kubectl, refs, policy);
+        }, () => resourceExistsOwned(kubectl, manifest.kind, manifest.metadata.name, refs.namespace, manifest.metadata.labels));
       }
+      if (refs.ingressTLSSecret) await transaction.create(`secret:${refs.ingressTLSSecret}`, () => waitForCertManagerTLSSecret(kubectl, refs, policy), () => deleteCertManagerTLSSecret(kubectl, refs, policy), () => certManagerTLSSecretExistsOwned(kubectl, refs, policy));
       if (policy.egress.mode === 'managed') await kubectl(['rollout', 'status', `deployment/${refs.gatewayDeployment}`, '-n', refs.namespace, '--timeout=120s'], { timeoutMs: 150_000 });
       const seed = manifests.seedPod;
       await transaction.create(`pod:${seed.metadata.name}`, () => createManifest(kubectl, seed), () => deleteResource(kubectl, 'pod', seed.metadata.name, refs.namespace), () => resourceExistsOwned(kubectl, 'pod', seed.metadata.name, refs.namespace, seed.metadata.labels));
@@ -89,7 +93,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
       await deleteResource(kubectl, 'pod', seed.metadata.name, refs.namespace);
       await transaction.create(`deployment:${refs.deployment}`, () => createManifest(kubectl, manifests.deployment), () => deleteResource(kubectl, 'deployment', refs.deployment, refs.namespace), () => resourceExistsOwned(kubectl, 'deployment', refs.deployment, refs.namespace, manifests.deployment.metadata.labels));
       await kubectl(['rollout', 'status', `deployment/${refs.deployment}`, '-n', refs.namespace, '--timeout=120s'], { timeoutMs: 150_000 });
-      await verifyKubernetesWorkspace(kubectl, meta);
+      await verifyKubernetesWorkspace(kubectl, meta, policy);
       await health(info);
       } finally {
         await sourceSnapshot.dispose();
@@ -99,7 +103,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
 
   async function target(info) {
     const meta = readMetadata(info, provider, policy);
-    await verifyKubernetesWorkspace(kubectl, meta);
+    await verifyKubernetesWorkspace(kubectl, meta, policy);
     const state = await readOwnedState(meta);
     if (policy.kubernetes.connectivity === 'ingress') {
       const ingress = resolveIngressTarget(policy.kubernetes.ingress, meta.providerResourceID);
@@ -121,10 +125,11 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
     const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
     stopPortForward(meta.providerResourceID);
     return cleanupTransaction(meta.providerResourceID, async (cleanup) => {
-      await verifyExistingResources(kubectl, meta);
+      await verifyExistingResources(kubectl, meta, policy);
       for (const [kind, name] of expectedResources(refs).filter(([resourceKind]) => !['pvc'].includes(resourceKind))) {
         await cleanup.remove(`${kind}:${name}`, () => deleteResource(kubectl, kind, name, refs.namespace));
       }
+      if (refs.ingressTLSSecret) await cleanup.remove(`secret:${refs.ingressTLSSecret}`, () => deleteCertManagerTLSSecret(kubectl, refs, policy));
       if (!policy.retention.preserveOnDelete) {
         await cleanup.remove(`pvc:${refs.mutablePVC}`, () => deleteResource(kubectl, 'pvc', refs.mutablePVC, refs.namespace));
         await cleanup.remove(`pvc:${refs.baselinePVC}`, () => deleteResource(kubectl, 'pvc', refs.baselinePVC, refs.namespace));
@@ -154,7 +159,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
 
   async function exportWorkspace(info) {
     const meta = readMetadata(info, provider, policy);
-    await verifyKubernetesWorkspace(kubectl, meta);
+    await verifyKubernetesWorkspace(kubectl, meta, policy);
     const state = await readOwnedState(meta);
     const snapshot = await runJson('kubectl', [...contextArgs(policy), 'exec', `deployment/${meta.resourceRefs.deployment}`, '-n', meta.resourceRefs.namespace, '--', 'node', '-e', RUNTIME_ARTIFACT_SCRIPT, WORKSPACE_RUNTIME.baselineDirectory, WORKSPACE_RUNTIME.directory, state.baselineGeneration, String(ARTIFACT_LIMITS.maxTextBytes), String(ARTIFACT_LIMITS.maxBlobBytes), String(ARTIFACT_LIMITS.maxTotalBytes)], { timeoutMs: 120_000, maxOutputBytes: ARTIFACT_LIMITS.maxOutputBytes, sensitiveOutput: true, sensitiveValues: [RUNTIME_ARTIFACT_SCRIPT] });
     return { ...snapshot, provider, providerResourceID: meta.providerResourceID };
@@ -163,7 +168,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
   async function reconcile(info) {
     const meta = readMetadata(info, provider, policy);
     try {
-      await verifyKubernetesWorkspace(kubectl, meta);
+      await verifyKubernetesWorkspace(kubectl, meta, policy);
       const state = await readOwnedState(meta);
       const remote = await target(info);
       await waitForHttpHealth(remote.url, remote.headers, { timeoutMs: 15_000 });
@@ -177,11 +182,11 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
 
   async function rotateCredentials(info, request = {}) {
     const meta = readMetadata(info, provider, policy);
-    await verifyKubernetesWorkspace(kubectl, meta);
+    await verifyKubernetesWorkspace(kubectl, meta, policy);
     await readOwnedState(meta);
     if (request.modelAuth != null && policy.credentials.modelAuth !== 'explicit-opencode-auth-content') throw new Error('Model authentication grants are disabled by workspace policy');
     return rotateWorkspaceCredentials(meta.providerResourceID, request, async ({ token, modelAuth }) => {
-      await verifyKubernetesWorkspace(kubectl, meta);
+      await verifyKubernetesWorkspace(kubectl, meta, policy);
       const stringData = { 'endpoint-token': token };
       if (modelAuth !== undefined) stringData['model-auth.json'] = modelAuth;
       const resourceVersion = (await kubectl(['get', 'secret', meta.resourceRefs.secret, '-n', meta.resourceRefs.namespace, '-o', 'jsonpath={.metadata.resourceVersion}'], { timeoutMs: 30_000 })).stdout;
@@ -298,7 +303,7 @@ function buildIngress(identity, refs, ingressPolicy) {
   const target = resolveIngressTarget(ingressPolicy, identity.providerResourceID);
   const annotations = { ...ingressPolicy.annotations };
   if (ingressPolicy.tls.mode === 'cert-manager') annotations['cert-manager.io/cluster-issuer'] = ingressPolicy.tls.clusterIssuer;
-  return resource('networking.k8s.io/v1', 'Ingress', refs.ingress, refs.namespace, providerLabels(identity, 'ingress'), { metadata: { name: refs.ingress, namespace: refs.namespace, labels: providerLabels(identity, 'ingress'), annotations }, spec: { ingressClassName: ingressPolicy.ingressClassName, tls: [{ hosts: [target.host], secretName: ingressPolicy.tls.mode === 'existing-secret' ? ingressPolicy.tls.secretName : `${refs.ingress}-tls` }], rules: [{ host: target.host, http: { paths: [{ path: target.path, pathType: 'Prefix', backend: { service: { name: refs.service, port: { number: WORKSPACE_RUNTIME.port } } } }] } }] } });
+  return resource('networking.k8s.io/v1', 'Ingress', refs.ingress, refs.namespace, providerLabels(identity, 'ingress'), { metadata: { name: refs.ingress, namespace: refs.namespace, labels: providerLabels(identity, 'ingress'), annotations }, spec: { ingressClassName: ingressPolicy.ingressClassName, tls: [{ hosts: [target.host], secretName: ingressPolicy.tls.mode === 'existing-secret' ? ingressPolicy.tls.secretName : refs.ingressTLSSecret }], rules: [{ host: target.host, http: { paths: [{ path: target.path, pathType: 'Prefix', backend: { service: { name: refs.service, port: { number: WORKSPACE_RUNTIME.port } } } }] } }] } });
 }
 
 export function resolveIngressTarget(policy, providerResourceID) {
@@ -328,16 +333,55 @@ async function assertResourcesAbsent(kubectl, refs) {
     const exists = await kubectl(['get', kind, name, '-n', refs.namespace, '-o', 'name'], { timeoutMs: 20_000 }).then(() => true).catch((error) => { if (isNotFound(error)) return false; throw error; });
     if (exists) throw new OwnershipError(`Kubernetes resource collision: ${kind}/${name}`);
   }
+  if (refs.ingressTLSSecret && await certManagerTLSSecretExists(kubectl, refs)) throw new OwnershipError(`Kubernetes resource collision: secret/${refs.ingressTLSSecret}`);
 }
 
-async function verifyKubernetesWorkspace(kubectl, meta) {
+async function verifyKubernetesWorkspace(kubectl, meta, policy) {
   const identity = identityFromMetadata(meta);
   for (const [kind, name, role] of expectedResources(meta.resourceRefs)) await verifyResource(kubectl, kind, name, meta.resourceRefs.namespace, providerLabels(identity, role));
+  if (meta.resourceRefs.ingressTLSSecret) await verifyCertManagerTLSSecret(kubectl, meta.resourceRefs, policy);
 }
 
-async function verifyExistingResources(kubectl, meta) {
+async function verifyExistingResources(kubectl, meta, policy) {
   const identity = identityFromMetadata(meta);
   for (const [kind, name, role] of expectedResources(meta.resourceRefs)) await verifyResource(kubectl, kind, name, meta.resourceRefs.namespace, providerLabels(identity, role)).catch((error) => { if (!isNotFound(error)) throw error; });
+  if (meta.resourceRefs.ingressTLSSecret) await verifyCertManagerTLSSecret(kubectl, meta.resourceRefs, policy).catch((error) => { if (!isNotFound(error)) throw error; });
+}
+
+async function waitForCertManagerTLSSecret(kubectl, refs, policy) {
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    if (await certManagerTLSSecretExistsOwned(kubectl, refs, policy)) return;
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  throw new Error(`Kubernetes cert-manager TLS secret was not issued: ${refs.ingressTLSSecret}`);
+}
+
+async function certManagerTLSSecretExists(kubectl, refs) {
+  return kubectl(['get', 'secret', refs.ingressTLSSecret, '-n', refs.namespace, '-o', 'name'], { timeoutMs: 20_000 }).then(() => true).catch((error) => { if (isNotFound(error)) return false; throw error; });
+}
+
+async function certManagerTLSSecretExistsOwned(kubectl, refs, policy) {
+  try {
+    await verifyCertManagerTLSSecret(kubectl, refs, policy);
+    return true;
+  } catch (error) {
+    if (isNotFound(error)) return false;
+    throw error;
+  }
+}
+
+async function verifyCertManagerTLSSecret(kubectl, refs, policy) {
+  const { stdout } = await kubectl(['get', 'secret', refs.ingressTLSSecret, '-n', refs.namespace, '-o', 'json'], { timeoutMs: 30_000 });
+  const secret = JSON.parse(stdout);
+  const annotations = secret.metadata?.annotations ?? {};
+  if (secret.type !== 'kubernetes.io/tls' || annotations['cert-manager.io/certificate-name'] !== refs.ingressTLSSecret || annotations['cert-manager.io/issuer-kind'] !== 'ClusterIssuer' || annotations['cert-manager.io/issuer-name'] !== policy.kubernetes.ingress.tls.clusterIssuer) throw new OwnershipError(`Kubernetes cert-manager TLS secret ownership mismatch for ${refs.ingressTLSSecret}`);
+}
+
+async function deleteCertManagerTLSSecret(kubectl, refs, policy) {
+  if (!await certManagerTLSSecretExists(kubectl, refs)) return;
+  await verifyCertManagerTLSSecret(kubectl, refs, policy);
+  await deleteResource(kubectl, 'secret', refs.ingressTLSSecret, refs.namespace);
 }
 
 async function verifyResource(kubectl, kind, name, namespace, expected) {

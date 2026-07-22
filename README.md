@@ -69,6 +69,8 @@ Kubernetes always requires controlled DNS CIDRs. NetworkPolicy also permits DNS 
 
 Apple Container is rejected as unsupported outside macOS and never falls back to Docker.
 
+Apple Container live certification is environment-gated. Set `OPENCHAMBER_APPLE_CONTAINER_WORKSPACE_INTEGRATION_IMAGE` to a locally available immutable image reference and run `bunx vitest run src/providers/apple-container.integration.test.js`; set `OPENCHAMBER_APPLE_CONTAINER_WORKSPACE_INTEGRATION_RESTART_SYSTEM=true` to include system stop/start recovery. The restart option stops all Apple Container workloads on the host and is therefore reserved for an isolated certification environment.
+
 ## Security Model
 
 - Control-plane workspace IDs and immutable provider resource IDs are distinct.

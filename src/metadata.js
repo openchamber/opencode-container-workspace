@@ -75,7 +75,10 @@ export function canonicalResourceRefs(providerResourceID, provider, policy) {
       refs.gatewayService = `${base}-egress`;
       refs.gatewayNetworkPolicy = `${base}-egress`;
     }
-    if (policy.kubernetes.connectivity === 'ingress') refs.ingress = base;
+    if (policy.kubernetes.connectivity === 'ingress') {
+      refs.ingress = base;
+      if (policy.kubernetes.ingress.tls.mode === 'cert-manager') refs.ingressTLSSecret = `${base}-tls`;
+    }
     return refs;
   }
   return { runtime: base, mutableVolume: `${base}-data`, baselineVolume: `${base}-baseline`, secretVolume: `${base}-secrets`, network: `${base}-network` };
