@@ -87,6 +87,9 @@ describe('Docker provider security and transactions', () => {
       expect(command).toEqual(expect.arrayContaining(['--user', '1000:1000', '--network', 'none', '--cap-drop', 'ALL']));
       expect(command).not.toContain('--cap-add');
     }
+    const secretCommand = helperCommands.find((command) => command.some((arg) => arg.startsWith(`${info.extra.resourceRefs.secretVolume}:`)));
+    expect(secretCommand).toContain('-i');
+    expect(secretCommand).not.toContainEqual(expect.stringContaining('/input'));
     const runtimeCommand = processMocks.run.mock.calls.map(([, args]) => args).find((args) => args.includes(info.extra.resourceRefs.runtime) && args.includes('-d'));
     expect(runtimeCommand).toEqual(expect.arrayContaining(['--read-only', '--tmpfs', '/tmp:rw,exec,nosuid,size=256m']));
     expect(runtimeCommand.some((arg) => arg.startsWith('OPENCODE_WORKSPACE_ID='))).toBe(false);

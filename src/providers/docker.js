@@ -1,5 +1,4 @@
 import { createServer } from 'node:net';
-import { dirname } from 'node:path';
 import { commandExists, run, runJson } from '../process.js';
 import { ProviderUnavailableError, OwnershipError } from '../errors.js';
 import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
@@ -69,7 +68,7 @@ export function createDockerProvider({ policy, sourceDirectory }) {
         async () => undefined,
         () => verifyDockerSeed(image, refs.baselineVolume, WORKSPACE_RUNTIME.baselineDirectory, sourceSnapshot.generation),
       );
-      await seedSecretVolume(image, refs.secretVolume, dirname(secrets.tokenPath));
+      await updateSecretVolume(image, refs.secretVolume, secrets.token, secrets.modelAuth);
       await transaction.create(`container:${refs.gateway}`, () => startEgressGateway({ runtimeImage: image, refs, identity, egress: policy.egress }), () => removeDocker('container', refs.gateway), () => dockerResourceExistsOwned('container', refs.gateway, providerLabels(identity, 'egress-gateway')));
       await transaction.create(
         `network-attachment:${refs.gateway}:${refs.network}`,
@@ -230,10 +229,6 @@ async function verifyDockerSeed(image, volume, mountPath, generation) {
   } catch {
     return false;
   }
-}
-
-async function seedSecretVolume(image, secretVolume, secretDirectory) {
-  await run('docker', ['run', '--rm', '--user', '1000:1000', '--network', 'none', '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL', '-v', `${secretVolume}:${PROVIDER_SECRET_DIRECTORY}`, '-v', `${secretDirectory}:/input:ro`, image, 'sh', '-lc', `set -eu; cp /input/endpoint-token ${PROVIDER_TOKEN_FILE}; if [ -f /input/model-auth.json ]; then cp /input/model-auth.json ${PROVIDER_MODEL_AUTH_FILE}; fi; chmod 700 ${PROVIDER_SECRET_DIRECTORY}; chmod 400 ${PROVIDER_SECRET_DIRECTORY}/*`], { timeoutMs: 60_000 });
 }
 
 async function updateSecretVolume(image, secretVolume, token, modelAuth) {

@@ -74,6 +74,7 @@ Apple Container is rejected as unsupported outside macOS and never falls back to
 - Resource names are canonical and rederived; metadata cannot select arbitrary resources.
 - Every provider resource is checked for managed, provider, project, resource-ID, and role labels before target, export, or deletion.
 - State and secrets are per workspace, mode-restricted, atomically replaced, fsynced, and protected by cross-process locks.
+- Docker and Apple Container seed provider-owned secret volumes through redacted stdin; private host secret directories are never bind-mounted into helper containers.
 - Create uses a durable journal and rolls back only resources successfully created by that operation. Interrupted creation is bound to the original source generation and refuses to reseed storage from changed host content.
 - Cleanup is idempotent for absent resources and refuses foreign resources.
 - Mutable storage and an immutable runtime-read-only baseline are seeded from the same source archive, preserving dirty Git and non-Git source content.

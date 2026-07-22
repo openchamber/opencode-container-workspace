@@ -1,5 +1,4 @@
 import { createServer } from 'node:net';
-import { dirname } from 'node:path';
 import { commandExists, run, runJson } from '../process.js';
 import { OwnershipError, ProviderUnavailableError } from '../errors.js';
 import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
@@ -64,7 +63,7 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
         async () => undefined,
         () => verifyAppleSeed(container, image, refs.baselineVolume, WORKSPACE_RUNTIME.baselineDirectory, sourceSnapshot.generation),
       );
-      await seedSecretVolume(container, image, refs.secretVolume, dirname(secrets.tokenPath));
+      await updateSecretVolume(container, image, refs.secretVolume, secrets.token, secrets.modelAuth);
       const inspectedNetwork = await containerJson(['network', 'inspect', refs.network], { timeoutMs: 20_000 });
       const runtimeMeta = withAppleProxy({ policy }, inspectedNetwork?.[0]);
       const args = [
@@ -188,10 +187,6 @@ async function verifyAppleSeed(container, image, volume, mountPath, generation) 
   } catch {
     return false;
   }
-}
-
-async function seedSecretVolume(container, image, secretVolume, secretDirectory) {
-  await container(['run', '--rm', '--user', '1000:1000', '--network', 'none', '--cap-drop', 'ALL', '--volume', `${secretVolume}:${PROVIDER_SECRET_DIRECTORY}`, '--mount', `type=bind,source=${secretDirectory},target=/input,readonly`, image, 'sh', '-lc', `set -eu; cp /input/endpoint-token ${PROVIDER_TOKEN_FILE}; if [ -f /input/model-auth.json ]; then cp /input/model-auth.json ${PROVIDER_MODEL_AUTH_FILE}; fi; chmod 700 ${PROVIDER_SECRET_DIRECTORY}; chmod 400 ${PROVIDER_SECRET_DIRECTORY}/*`], { timeoutMs: 60_000 });
 }
 
 async function updateSecretVolume(container, image, secretVolume, token, modelAuth) {
