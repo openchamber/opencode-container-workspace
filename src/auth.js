@@ -1,52 +1,90 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { randomBytes, createHash } from 'node:crypto';
-import { homedir } from 'node:os';
-import { canonicalWorkspaceLabelID } from './label-id.js';
-
-const STATE_DIR = join(homedir(), '.config', 'openchamber', 'workspace-plugin');
-const TOKEN_FILE = join(STATE_DIR, 'tokens.json');
+import { randomBytes } from 'node:crypto';
+import { deleteWorkspaceSecret, readWorkspaceSecret, withWorkspaceLock, writeWorkspaceSecret } from './state-store.js';
 
 export const AUTH_HEADER = 'x-openchamber-workspace-token';
+export const AUTH_SECRET_NAME = 'endpoint-token';
+export const MODEL_AUTH_SECRET_NAME = 'model-auth.json';
 
-export function createTokenRef(workspaceID) {
-  const hash = createHash('sha256').update(canonicalWorkspaceLabelID(workspaceID)).digest('hex').slice(0, 24);
-  return `workspace-${hash}`;
+export function createTokenRef(providerResourceID) {
+  return `${providerResourceID}/${AUTH_SECRET_NAME}`;
 }
 
-export async function createWorkspaceToken(workspaceID) {
-  const token = randomBytes(32).toString('base64url');
-  const tokenRef = createTokenRef(workspaceID);
-  const tokens = await readTokens();
-  tokens[tokenRef] = token;
-  await writeTokens(tokens);
-  return { tokenRef, token };
+export async function createWorkspaceSecrets(providerResourceID, env = {}) {
+  let suppliedModelAuth;
+  if (env.OPENCODE_AUTH_CONTENT !== undefined && env.OPENCODE_AUTH_CONTENT !== '') suppliedModelAuth = normalizeSuppliedModelAuth(env.OPENCODE_AUTH_CONTENT);
+  const token = await readWorkspaceSecret(providerResourceID, AUTH_SECRET_NAME).catch((error) => {
+    if (error?.code === 'WORKSPACE_SECRET_MISSING') return randomBytes(32).toString('base64url');
+    throw error;
+  });
+  const tokenPath = await writeWorkspaceSecret(providerResourceID, AUTH_SECRET_NAME, token);
+  let modelAuthPath;
+  const existingModelAuth = await readWorkspaceSecret(providerResourceID, MODEL_AUTH_SECRET_NAME).catch((error) => {
+    if (error?.code === 'WORKSPACE_SECRET_MISSING') return undefined;
+    throw error;
+  });
+  const modelAuth = existingModelAuth ?? suppliedModelAuth;
+  if (modelAuth !== undefined) modelAuthPath = await writeWorkspaceSecret(providerResourceID, MODEL_AUTH_SECRET_NAME, modelAuth);
+  return { token, tokenPath, modelAuth, modelAuthPath, tokenRef: createTokenRef(providerResourceID) };
 }
 
-export async function getWorkspaceToken(tokenRef) {
-  const tokens = await readTokens();
-  const token = tokens[tokenRef];
-  if (!token) throw new Error(`Workspace auth token is missing for ${tokenRef}`);
-  return token;
-}
-
-export async function deleteWorkspaceToken(tokenRef) {
-  const tokens = await readTokens();
-  delete tokens[tokenRef];
-  await writeTokens(tokens);
-}
-
-async function readTokens() {
+function normalizeSuppliedModelAuth(value) {
   try {
-    const raw = await readFile(TOKEN_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('expected an object');
+    return JSON.stringify(parsed);
+  } catch (cause) {
+    throw new TypeError(`OPENCODE_AUTH_CONTENT must be valid JSON object content: ${cause.message}`);
   }
 }
 
-async function writeTokens(tokens) {
-  await mkdir(STATE_DIR, { recursive: true, mode: 0o700 });
-  await writeFile(TOKEN_FILE, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+export function selectGrantedCredentials(policy, env = {}) {
+  if (policy.credentials.modelAuth !== 'explicit-opencode-auth-content') return {};
+  return env.OPENCODE_AUTH_CONTENT === undefined ? {} : { OPENCODE_AUTH_CONTENT: env.OPENCODE_AUTH_CONTENT };
+}
+
+export async function getWorkspaceToken(tokenRef) {
+  const [providerResourceID, name, extra] = String(tokenRef).split('/');
+  if (!providerResourceID || name !== AUTH_SECRET_NAME || extra !== undefined) throw new TypeError('Invalid workspace token reference');
+  return readWorkspaceSecret(providerResourceID, AUTH_SECRET_NAME);
+}
+
+export async function rotateWorkspaceCredentials(providerResourceID, request, updateProvider) {
+  return withWorkspaceLock(providerResourceID, async () => {
+  const previousToken = await readWorkspaceSecret(providerResourceID, AUTH_SECRET_NAME);
+  const previousModelAuth = await readWorkspaceSecret(providerResourceID, MODEL_AUTH_SECRET_NAME).catch((error) => {
+    if (error?.code === 'WORKSPACE_SECRET_MISSING') return undefined;
+    throw error;
+  });
+  const nextToken = request.rotateEndpointToken === false ? previousToken : randomBytes(32).toString('base64url');
+  const nextModelAuth = request.modelAuth === undefined ? previousModelAuth : request.modelAuth === null ? undefined : normalizeModelAuth(request.modelAuth);
+  try {
+    await updateProvider({ token: nextToken, modelAuth: nextModelAuth });
+    await writeWorkspaceSecret(providerResourceID, AUTH_SECRET_NAME, nextToken);
+    if (nextModelAuth === undefined) await deleteWorkspaceSecret(providerResourceID, MODEL_AUTH_SECRET_NAME);
+    else await writeWorkspaceSecret(providerResourceID, MODEL_AUTH_SECRET_NAME, nextModelAuth);
+  } catch (cause) {
+    const rollbackErrors = [];
+    try {
+      await updateProvider({ token: previousToken, modelAuth: previousModelAuth });
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+    try {
+      await writeWorkspaceSecret(providerResourceID, AUTH_SECRET_NAME, previousToken);
+      if (previousModelAuth === undefined) await deleteWorkspaceSecret(providerResourceID, MODEL_AUTH_SECRET_NAME);
+      else await writeWorkspaceSecret(providerResourceID, MODEL_AUTH_SECRET_NAME, previousModelAuth);
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+    if (rollbackErrors.length > 0) throw new AggregateError([cause, ...rollbackErrors], 'Credential rotation failed and rollback was incomplete', { cause });
+    throw cause;
+  }
+  return { rotatedEndpointToken: nextToken !== previousToken, modelAuth: nextModelAuth === undefined ? 'revoked' : 'configured' };
+  });
+}
+
+function normalizeModelAuth(value) {
+  const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new TypeError('Model authentication grant must be a JSON object');
+  return JSON.stringify(parsed);
 }

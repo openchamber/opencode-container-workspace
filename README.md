@@ -1,26 +1,29 @@
 # OpenChamber OpenCode Container Workspaces
 
-OpenCode workspace plugin that creates isolated workspaces backed by Docker containers, Kubernetes deployments, or Apple Container runtimes.
+OpenCode workspace plugin for isolated Docker, Kubernetes, and Apple Container workspaces. It can be used directly from OpenCode configuration or through OpenChamber.
 
-The plugin is designed for OpenChamber's Secure Workspaces UI, but it can also be configured directly in OpenCode.
+The authoritative production and release requirements are in the [Secure Workspaces specification](https://github.com/openchamber/openchamber/blob/main/docs/SECURE_WORKSPACES_SPECIFICATION.md). This package is not production-ready until the external release blockers listed there are complete.
+
+## Package Exports
+
+- `@openchamber/opencode-container-workspace`: OpenCode plugin entrypoint.
+- `@openchamber/opencode-container-workspace/operations`: private server-side provider validation, discovery, inspection, cleanup, and export operations.
+- `@openchamber/opencode-container-workspace/contracts`: runtime validators and TypeScript declarations for shared contracts.
+
+Provider secrets and arbitrary process helpers are intentionally not exported.
 
 ## Requirements
 
-- OpenCode with experimental workspaces enabled.
-- A workspace image that contains `opencode`, `git`, and a POSIX shell.
-- Docker CLI/daemon for the Docker provider.
-- `kubectl` and an existing namespace/context for the Kubernetes provider.
-- Apple Container CLI for the experimental `apple-container` provider on supported macOS hosts.
+- OpenCode with the compatible experimental workspace registry.
+- An explicitly configured digest-pinned runtime image containing OpenCode 1.18.4, Node.js, Git, tar, OpenSSH client, and a POSIX shell.
+- Docker CLI/daemon, `kubectl`, or Apple Container as appropriate.
+- A digest-pinned managed gateway image or an explicit external egress proxy. The package never silently permits direct runtime egress.
+- For Docker or Apple Container, `OPENCHAMBER_WORKSPACE_STATE_DIR` must be on a host path visible to the container runtime because source archives and file-backed secrets are staged there.
 
-## Install
+There is intentionally no default runtime image until a public signed multi-architecture image exists.
+Both image Dockerfiles require `NODE_BASE_IMAGE` as an immutable digest reference; the image workflow resolves and records that digest before building.
 
-```sh
-npm install @openchamber/opencode-container-workspace
-```
-
-Then add the plugin to your OpenCode config. OpenChamber writes this config automatically when Secure Workspaces are enabled in Settings.
-
-## OpenCode Config
+## Configuration
 
 ```json
 {
@@ -29,21 +32,27 @@ Then add the plugin to your OpenCode config. OpenChamber writes this config auto
       "@openchamber/opencode-container-workspace",
       {
         "defaultProvider": "docker",
-        "defaultImage": "ghcr.io/openchamber/opencode-workspace:1.0.0",
+        "defaultImage": "registry.example/workspace@sha256:<digest>",
+        "allowedImages": ["registry.example/workspace@sha256:<digest>"],
         "requirePinnedImage": true,
-        "allowedImages": ["ghcr.io/openchamber/opencode-workspace:1.0.0"],
-        "docker": {},
-        "appleContainer": {},
-        "kubernetes": {
-          "namespace": "openchamber-workspaces",
-          "connectivity": "port-forward",
-          "networkPolicy": "default-deny"
+        "credentials": {
+          "modelAuth": "explicit-opencode-auth-content"
         },
         "egress": {
-          "httpProxy": "http://proxy.openchamber.svc.cluster.local:3128",
-          "proxyCIDR": "10.0.0.10/32",
-          "dnsCIDRs": ["10.0.0.53/32"],
-          "noProxy": "127.0.0.1,localhost"
+          "mode": "managed",
+          "gatewayImage": "registry.example/workspace-egress@sha256:<digest>",
+          "preset": "restricted",
+          "allowedDomains": [],
+          "allowedCIDRs": [],
+          "dnsCIDRs": ["10.0.0.53/32"]
+        },
+        "kubernetes": {
+          "context": "workspaces",
+          "namespace": "openchamber-workspaces",
+          "allowedContexts": ["workspaces"],
+          "allowedNamespaces": ["openchamber-workspaces"],
+          "connectivity": "port-forward",
+          "networkPolicy": "default-deny"
         }
       }
     ]
@@ -51,50 +60,45 @@ Then add the plugin to your OpenCode config. OpenChamber writes this config auto
 }
 ```
 
-## Options
+`credentials.modelAuth` defaults to `none`. Setting it to `explicit-opencode-auth-content` is the trusted-policy grant that allows the plugin to parse OpenCode's supplied model authentication and place it in provider secret files. Credential content is never placed in Docker/Apple CLI environment arguments, Kubernetes Deployment environment values, metadata, diagnostics, or adapter targets. Server operations support endpoint-token rotation, model-auth replacement, and revocation.
 
-- `defaultProvider`: `docker`, `kubernetes`, or `apple-container`.
-- `defaultImage`: runtime image used for new workspaces.
-- `allowedImages`: optional allow-list. Supports exact matches and `*` suffix prefixes.
-- `requirePinnedImage`: when true, images must use a digest or explicit non-`latest` tag.
-- `docker.networkMode`: `openchamber-secure-workspaces` by default. The plugin creates this as an owned internal bridge network so local-only host port publishing works while container egress through that network is denied. `none` is supported for direct plugin use but makes the runtime unreachable through host port publishing.
-- `docker.allowedNetworks`: explicit allow-list for additional Docker networks that may be attached to workspace containers, such as `bridge` for installations that intentionally permit broader connectivity.
-- `docker.memoryLimit`: optional Docker memory limit.
-- `docker.cpuLimit`: optional Docker CPU limit.
-- `appleContainer.cli`: Apple Container CLI path, default `container`.
-- `appleContainer.networkMode`: `openchamber-secure-workspaces-apple` by default. The plugin creates this as an owned host-only vmnet network.
-- `appleContainer.memoryLimit`: optional Apple Container memory limit.
-- `appleContainer.cpuLimit`: optional Apple Container CPU limit.
-- `kubernetes.context`: optional kube context.
-- `kubernetes.namespace`: existing namespace for workspace resources.
-- `kubernetes.connectivity`: `port-forward` or `ingress`.
-- `kubernetes.networkPolicy`: `default-deny` by default. The plugin creates a per-workspace NetworkPolicy with no ingress and egress limited to configured DNS CIDRs plus the configured proxy CIDR/port. Set `disabled` only when the cluster provides equivalent isolation externally.
-- `kubernetes.ingressBaseUrl`: base URL for ingress mode.
-- `kubernetes.storage`: PVC size, default `8Gi`.
-- `kubernetes.cpuRequest`, `kubernetes.memoryRequest`, `kubernetes.cpuLimit`, `kubernetes.memoryLimit`: pod resources.
-- `egress.httpProxy`: required for default isolated Docker, Kubernetes, and Apple Container workspaces. Runtime provider/model traffic is sent through this explicit proxy via `HTTP_PROXY`/`HTTPS_PROXY`. For Apple Container, configure a host-local proxy URL such as `http://127.0.0.1:3128`; the plugin rewrites it to the inspected vmnet gateway inside the runtime.
-- `egress.proxyCIDR`: required for Kubernetes `default-deny`; CIDR containing the approved egress proxy.
-- `egress.dnsCIDRs`: required for Kubernetes `default-deny`; CIDRs for DNS servers the workspace may query.
-- `egress.noProxy`: optional `NO_PROXY` value for local/runtime bypasses.
-- `retention.preserveOnDelete`: keep workspace storage after removing the workspace.
+Kubernetes always requires controlled DNS CIDRs. NetworkPolicy also permits DNS only to standard CoreDNS pods selected by `kube-system` and `k8s-app=kube-dns`, covering clusters that enforce policy after Service translation. External mode additionally requires `egress.proxyUrl` and `egress.proxyCIDR`. Ingress mode requires an ingress class, canonical host template, root path, existing-secret or cert-manager TLS, controller namespace/pod selectors, and allowlisted annotations. Disabled NetworkPolicy remains rejected.
 
-Environment variables with the `OPENCHAMBER_WORKSPACE_*` prefix can also be used for host-level defaults.
+Apple Container is rejected as unsupported outside macOS and never falls back to Docker.
 
-## Behavior
+## Security Model
 
-- Each workspace runs its own `opencode serve` inside the container or pod.
-- Source files are copied into isolated storage rather than mounted writeable from the host.
-- Docker uses a managed volume, an owned internal bridge network, and local-only port mapping.
-- Apple Container uses a managed volume, an owned host-only vmnet network, explicit host-proxy egress, and local-only port publishing. This provider is experimental and remains separate from Docker because Apple Container networking differs from Docker bridge networking.
-- Kubernetes uses Secret, PVC, Deployment, and Service resources in an existing namespace.
-- Kubernetes creates a default-deny NetworkPolicy for each workspace unless explicitly disabled. In default-deny mode, egress is limited to configured DNS CIDRs and the configured proxy CIDR/port.
-- Kubernetes does not create namespaces automatically.
-- Exported diffs include tracked, staged, unstaged, binary, and untracked files without mutating the workspace index.
+- Control-plane workspace IDs and immutable provider resource IDs are distinct.
+- Resource names are canonical and rederived; metadata cannot select arbitrary resources.
+- Every provider resource is checked for managed, provider, project, resource-ID, and role labels before target, export, or deletion.
+- State and secrets are per workspace, mode-restricted, atomically replaced, fsynced, and protected by cross-process locks.
+- Create uses a durable journal and rolls back only resources successfully created by that operation. Interrupted creation is bound to the original source generation and refuses to reseed storage from changed host content.
+- Cleanup is idempotent for absent resources and refuses foreign resources.
+- Mutable storage and an immutable runtime-read-only baseline are seeded from the same source archive, preserving dirty Git and non-Git source content.
+- Runtime endpoint authentication uses a random 256-bit file-backed token and constant-time comparison across HTTP, SSE, and WebSocket.
+- OpenCode receives a stable, unauthenticated loopback transport URL per workspace. A private host-process shim verifies the provider target, strips client credentials and routing headers, rereads the canonical workspace token for every new HTTP or WebSocket connection, and injects it only toward that workspace's fixed upstream.
+- The shim trusts processes running as the same OS user on the host. Containers, Kubernetes ingress/cluster peers, LAN peers, and remote clients remain outside that boundary; provider health and reconciliation continue to use the unchanged authenticated provider target directly.
+- Provider process output is bounded and sensitive values are redacted.
+- Snapshot traversal detects source mutation, rejects escaping symlinks/hard links/special files, and enforces entry, file, and total byte limits.
+- Structured binary-safe artifacts represent additions, modifications, deletions, exact renames, mode changes, symlinks, baseline/result hashes, and bounded blobs for Git and non-Git projects.
 
-## Connectivity Smoke Tests
+Docker uses one internal network per workspace, separate mutable/baseline/secret volumes, a managed policy gateway or fixed-destination external-proxy bridge with no workspace mounts, a hardened non-root runtime, and a mountless access proxy attached to both the internal and default bridges with a loopback-only host bind. The external bridge supports HTTP and certificate-verified HTTPS proxy endpoints; connection deadlines do not terminate healthy idle SSE or WebSocket streams. Kubernetes creates separate PVCs, a Secret, dedicated ServiceAccount, runtime and gateway Deployments/Services, role-scoped NetworkPolicies, optional HTTPS Ingress, hardened security contexts, and authenticated probes. Apple Container supports the external-proxy path with per-workspace host-only networking; managed gateway mode is rejected until multi-network attachment is validated on a supported live host. Apple Container has no exact `no-new-privileges` equivalent.
 
-The Docker integration test is opt-in because it needs a real workspace image and provider credentials. Set `OPENCHAMBER_DOCKER_WORKSPACE_INTEGRATION_IMAGE` plus `OPENCHAMBER_DOCKER_WORKSPACE_INTEGRATION_HTTP_PROXY`; optionally set `OPENCHAMBER_DOCKER_WORKSPACE_INTEGRATION_PROMPT_COMMAND` to a command that performs a real provider prompt from inside the workspace container. The test runs that command with `docker exec` after `/global/health` succeeds.
+## Server Operations
 
-## Export Flow
+```js
+import { createWorkspaceProviderOperations } from '@openchamber/opencode-container-workspace/operations';
 
-The plugin implements provider-level `exportDiff`, but OpenCode does not currently expose that method over the experimental workspace HTTP API. OpenChamber provides the user-facing export/review/apply flow on top.
+const operations = createWorkspaceProviderOperations({ policy, sourceDirectory });
+const validation = await operations.validateProvider('docker');
+const discovery = await operations.discoverProject(projectID);
+const recovered = await operations.adoptWorkspace(workspace);
+const diagnostics = await operations.reconcileWorkspace(workspace);
+await operations.rotateWorkspaceCredentials(workspace, { modelAuth: null });
+```
+
+Instantiate operations only in trusted server code using persisted policy. `adoptWorkspace` verifies provider resources and persisted state using the original metadata before atomically rebinding a recovered record's current OpenCode ID; provider resource, project, provider, and original audit identity remain immutable. Cleanup and export perform the same verified adoption automatically. Discovery reports failures per provider instead of converting them to an authoritative empty result.
+
+## Current External Blockers
+
+The host transport shim supports OpenCode versions that omit target headers during WebSocket upgrades, and OpenChamber uses immutable reviewed context handoff instead of warp/detach. Local orchestration compensates known provisional rows and safely adopts a recovered `syncList` row; an upstream stable discovery ID remains preferred but is not required for safe ownership verification. Production release still requires an exact published plugin, public signed multi-architecture runtime and gateway images, updated OpenChamber dependency pins, Apple Container and Kubernetes ingress certification, packaged desktop/mobile platform matrices, and release credentials. See the specification for the complete release gates.

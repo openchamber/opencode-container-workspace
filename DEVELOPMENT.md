@@ -1,99 +1,43 @@
-# Development Handoff
+# Development
 
-Date: 2026-07-21
+This repository owns the provider lifecycle, isolation, authentication, reconciliation, export collection, runtime images, and managed egress implementation for OpenChamber Secure Workspaces.
 
-This repository is the intended home for OpenChamber's OpenCode Secure Workspaces plugin.
+The authoritative production requirements and acceptance gates are maintained in the [OpenChamber Secure Workspaces production specification](https://github.com/openchamber/openchamber/blob/main/docs/SECURE_WORKSPACES_SPECIFICATION.md). Do not duplicate implementation status, release blockers, or alternative architecture decisions in this file.
 
-## Relationship To OpenChamber
+## Repositories
 
-- OpenChamber app repo: `/Users/iivashko/projects/openchamber`
-- Source before extraction: `/Users/iivashko/projects/openchamber/packages/opencode-workspace-plugin`
-- This repo: `/Users/iivashko/projects/opencode-container-workspace`
-- Remote: `git@github.com:openchamber/opencode-container-workspace.git`
+- Plugin: `openchamber/opencode-container-workspace`
+- OpenChamber integration: `openchamber/openchamber`
+- Package: `@openchamber/opencode-container-workspace`
 
-This repository is the canonical plugin source after extraction. The package name is fixed to match the repository owner/name decision:
+The plugin repository is the canonical source for plugin code. OpenChamber consumes an exact reviewed package version or immutable development pin and stages installed package contents for Electron.
 
-- `@openchamber/opencode-container-workspace`
+## Local Commands
 
-Package exports:
+Use `package.json` scripts as the command source of truth:
 
-- `.` -> `./src/plugin.js`
-- `./label-id` -> `./src/label-id.js`
-- `./policy` -> `./src/policy.js`
+```sh
+bun install
+bun run build
+bun run type-check
+bun run lint
+bun run test
+```
 
-Do not add compatibility aliases for the temporary in-monorepo package name; no user workspace settings have shipped with that name.
+Provider integration tests require the corresponding local runtime and explicit test configuration. They must never use production credentials or mutate a real project fixture.
 
-## Provider Invariants
+## Contribution Rules
 
-### Docker
+- Treat workspace metadata as recovery data, not proof of ownership.
+- Keep provider commands, secrets, and resource cleanup inside the plugin boundary.
+- Never log credentials, target headers, source contents, or export artifacts.
+- Make create, rollback, cleanup, retry, and stale-resource behavior explicit.
+- Do not add policy fields that are not enforced by core provider behavior.
+- Do not rely on OpenChamber UI checks for provider security.
+- Keep OpenCode experimental-contract dependencies isolated and compatibility-tested against the pinned OpenCode release.
+- Keep the host transport shim Node-builtins-only and private. Its process-global registry and persisted loopback port are compatibility boundaries for plugin reloads and direct OpenCode installation.
+- Do not claim provider or release readiness from mocked tests alone.
 
-- Runtime container runs on the owned internal Docker bridge `openchamber-secure-workspaces`.
-- Runtime container must not publish ports directly.
-- A hardened localhost access-proxy sidecar publishes `4096/tcp` only on `127.0.0.1`.
-- Runtime and access-proxy use `no-new-privileges` and `--cap-drop ALL`.
-- Secure Docker mode requires explicit `egress.httpProxy`.
-- Proxy URLs with credentials are rejected.
-- Runtime token is file-backed, not a long-lived broad env token.
-- Source is copied into managed storage; host source is not mounted writable.
+## Documentation
 
-### Kubernetes
-
-- Uses Secret, PVC, Deployment, Service, and optional NetworkPolicy.
-- Default mode is `default-deny` NetworkPolicy.
-- Egress must be limited to configured DNS CIDRs plus configured proxy CIDR/port.
-- Requires explicit `egress.httpProxy`, `egress.proxyCIDR`, and `egress.dnsCIDRs` when NetworkPolicy is enabled.
-- `kubectl version --client=true` is used for CLI availability; `kubectl --version` is not portable on kubectl 1.36.
-- Source seeding uses tar stream with `tar --no-same-owner` to avoid macOS UID/GID chown failures in hardened pods.
-
-### Apple Container
-
-- Experimental provider; separate from Docker because Apple Container networking differs from Docker bridge networking.
-- Uses owned host-only vmnet network `openchamber-secure-workspaces-apple`.
-- Apple Container `default` NAT network gave DNS but direct outbound TCP timed out in local smoke; do not rely on a dual-network proxy sidecar model.
-- Host-side proxy via vmnet gateway works and is the required egress shape.
-- If config uses `http://127.0.0.1:<port>` or `http://localhost:<port>` as `egress.httpProxy`, runtime env is rewritten to the inspected vmnet gateway for the selected network.
-- Apple Container does not support dynamic publish syntax like `127.0.0.1::4096`; use a stable high localhost port derived from workspace ID and verify via `container inspect`.
-- Runtime publishes only to `127.0.0.1:<port>:4096`.
-- `--cap-drop ALL` is verified; exact `no-new-privileges` equivalent is not confirmed.
-- Recovery after `container system stop/start` still needs testing.
-
-## Runtime Image
-
-Default intended image:
-
-- `ghcr.io/openchamber/opencode-workspace:1.0.0`
-
-Current blocker:
-
-- `docker pull ghcr.io/openchamber/opencode-workspace:1.0.0` returned registry `denied`.
-
-Local E2E image used so far:
-
-- Docker tag: `openchamber/opencode-workspace-test:1.17.18-arm64`
-- Apple Container tag after load: `docker.io/openchamber/opencode-workspace-test:1.17.18-arm64`
-- Built from `runtime-image/Dockerfile` in this repository.
-- Pins `opencode-ai@1.17.18`.
-
-## Tested So Far
-
-- Docker/Colima E2E with auth, health, isolated network, explicit proxy, mutation, diff export, selective apply, cleanup.
-- Kubernetes kind + Calico E2E with real NetworkPolicy enforcement, direct egress blocked, proxy egress allowed, mutation, diff export, selective apply, cleanup.
-- External OpenCode compatibility after manual external server restart.
-- Apple Container live smoke: create, health, proxy gateway rewrite, mutation via `container exec`, diff export, cleanup.
-- Package dry-run previously tightened to exclude test files.
-
-## Not Fully Tested
-
-- Published GHCR release image and multi-arch manifest.
-- Windows and Linux platform matrix.
-- Packaged Electron GUI flow using the externalized plugin.
-- Selective apply conflict and artifact mismatch/expiration scenarios.
-- Apple Container recovery after service restart.
-- Apple Container exact security equivalent to Docker `no-new-privileges`.
-
-## Immediate Extraction Tasks
-
-1. Run plugin tests/lint locally.
-2. Update OpenChamber to depend on this repo/package rather than vendoring source.
-3. Re-run OpenChamber web/UI/Electron validation.
-4. Continue remaining E2E and platform matrix.
+Update this file only for repository-local development workflow. Update `README.md` for the package's currently released installation and configuration interface. Update the canonical OpenChamber specification when architecture, security invariants, supported behavior, or release gates change.

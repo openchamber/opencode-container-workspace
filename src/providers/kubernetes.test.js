@@ -1,127 +1,105 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
+import { readPolicy } from '../policy.js';
+import { buildManifests, createKubernetesProvider, KUBERNETES_SEED_EXTRACT_COMMAND, kubernetesCredentialRefreshCommands } from './kubernetes.js';
+import { canonicalResourceRefs, deriveWorkspaceIdentity } from '../metadata.js';
 
-const processMocks = vi.hoisted(() => ({
-  run: vi.fn(),
-  spawnBackground: vi.fn(),
-}));
-
-const authMocks = vi.hoisted(() => ({
-  createWorkspaceToken: vi.fn(async (id) => ({ tokenRef: `token-${id}`, token: `secret-${id}` })),
-  deleteWorkspaceToken: vi.fn(async () => undefined),
-  getWorkspaceToken: vi.fn(async () => 'runtime-token'),
-}));
-
-vi.mock('../process.js', async (importOriginal) => {
-  const actual = await importOriginal();
-  return {
-    ...actual,
-    run: processMocks.run,
-    spawnBackground: processMocks.spawnBackground,
-  };
-});
-
-vi.mock('../auth.js', async (importOriginal) => {
-  const actual = await importOriginal();
-  return { ...actual, ...authMocks };
-});
-
-const { readPolicy } = await import('../policy.js');
-const { createKubernetesProvider } = await import('./kubernetes.js');
-
-function readKubernetesTestPolicy() {
+function policy() {
   return readPolicy({
-    defaultImage: 'workspace-image:1.0.0',
-    requirePinnedImage: false,
-    egress: {
-      httpProxy: 'http://10.0.0.10:3128',
-      proxyCIDR: '10.0.0.10/32',
-      dnsCIDRs: ['10.0.0.53/32'],
-      noProxy: '127.0.0.1,localhost',
-    },
+    defaultImage: 'workspace-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    egress: { mode: 'external', proxyUrl: 'http://10.0.0.10:3128', proxyCIDR: '10.0.0.10/32', dnsCIDRs: ['10.0.0.53/32'] },
+    kubernetes: { allowedNamespaces: ['openchamber-workspaces'] },
   });
 }
 
-describe('kubernetes workspace provider identity reconstruction', () => {
-  beforeEach(() => {
-    processMocks.run.mockReset();
-    processMocks.run.mockResolvedValue({ stdout: '', stderr: '' });
-    authMocks.createWorkspaceToken.mockClear();
+describe('Kubernetes provider manifests', () => {
+  it('does not overwrite mounted PVC root metadata while extracting either source copy', () => {
+    expect(KUBERNETES_SEED_EXTRACT_COMMAND.match(/tar --no-same-owner --no-overwrite-dir --strip-components=1/g)).toHaveLength(1);
+    expect(KUBERNETES_SEED_EXTRACT_COMMAND).toContain('-C "$1"');
+    expect(KUBERNETES_SEED_EXTRACT_COMMAND).toContain('$1/.openchamber-runtime/source-generation');
   });
 
-  it.each(['ws:1/abc', '_ws', 'ws_', '.'])('reconstructs listed workspace ID %s with the same token ref and Secret after restart', async (workspaceID) => {
-    const policy = readKubernetesTestPolicy();
-    const provider = createKubernetesProvider({ policy, sourceDirectory: '/source' });
-    const info = provider.configure({ id: workspaceID, projectID: 'project:1' });
-    expect(info.extra.labels['openchamber.io/workspace-id']).toMatch(/^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$/);
-    processMocks.run
-      .mockResolvedValueOnce({ stdout: 'Client Version: v1.36.2\n', stderr: '' })
-      .mockResolvedValueOnce({
-      stdout: JSON.stringify({
-        items: [{
-          metadata: {
-            name: info.extra.runtime.deployment,
-            labels: info.extra.labels,
-          },
-        }],
-      }),
-      stderr: '',
-    });
-
-    const listed = await provider.list({ instance: { project: { id: 'project:1' } } });
-
-    expect(listed).toHaveLength(1);
-    expect(listed[0].extra.auth.tokenRef).toBe(info.extra.auth.tokenRef);
-    expect(listed[0].extra.runtime.deployment).toBe(info.extra.runtime.deployment);
-    expect(listed[0].extra.runtime.service).toBe(info.extra.runtime.service);
-    expect(listed[0].extra.runtime.secret).toBe(info.extra.runtime.secret);
-    expect(listed[0].extra.runtime.networkPolicy).toBe(info.extra.runtime.networkPolicy);
-    expect(listed[0].extra.storage.pvc).toBe(info.extra.storage.pvc);
+  it('replaces the exact owned runtime pod before completing credential rotation', () => {
+    const currentPolicy = policy();
+    const info = createKubernetesProvider({ policy: currentPolicy, sourceDirectory: '/source' }).configure({ id: 'control-id', projectID: 'project-id' });
+    const commands = kubernetesCredentialRefreshCommands(info.extra);
+    expect(commands[0].args).toEqual([
+      'delete', 'pod', '-l', `openchamber.io/resource-id=${info.extra.providerResourceID},openchamber.io/role=runtime`,
+      '-n', currentPolicy.kubernetes.namespace, '--wait=true',
+    ]);
+    expect(commands[1].args).toContain(`deployment/${info.extra.resourceRefs.deployment}`);
   });
 
-  it('applies a default-deny NetworkPolicy for new workspaces by default', async () => {
-    const policy = readKubernetesTestPolicy();
-    const provider = createKubernetesProvider({ policy, sourceDirectory: '/source' });
-    const info = provider.configure({ id: 'ws_1', projectID: 'project:1' });
-    processMocks.run.mockImplementation(async (_binary, args, options = {}) => {
-      if (args.includes('can-i')) return { stdout: 'yes\n', stderr: '' };
-      if (args.includes('apply')) return { stdout: '', stderr: '' };
-      if (args.includes('rollout')) throw new Error('stop after manifest apply');
-      if (args.includes('get')) throw new Error('not found');
-      return { stdout: '', stderr: '' };
-    });
-
-    await expect(provider.create(info, { OPENCODE_AUTH_CONTENT: '{}' })).rejects.toThrow(/stop after manifest apply/);
-
-    const applyCall = processMocks.run.mock.calls.find(([, args]) => args.includes('apply'));
-    const manifest = JSON.parse(applyCall?.[2]?.input ?? '{}');
-    const networkPolicy = manifest.items.find((item) => item.kind === 'NetworkPolicy');
-    expect(networkPolicy).toMatchObject({
-      apiVersion: 'networking.k8s.io/v1',
-      metadata: { name: info.extra.runtime.networkPolicy, namespace: info.extra.runtime.namespace },
-      spec: {
-        podSelector: { matchLabels: { 'openchamber.io/workspace-id': info.extra.labels['openchamber.io/workspace-id'] } },
-        policyTypes: ['Ingress', 'Egress'],
-        ingress: [],
-        egress: [
-          {
-            to: [{ ipBlock: { cidr: '10.0.0.53/32' } }],
-            ports: [{ protocol: 'UDP', port: 53 }, { protocol: 'TCP', port: 53 }],
-          },
-          {
-            to: [{ ipBlock: { cidr: '10.0.0.10/32' } }],
-            ports: [{ protocol: 'TCP', port: 3128 }],
-          },
-        ],
-      },
-    });
+  it('creates separate baseline storage, ServiceAccount, enforced policy, probes, and provider secret files', () => {
+    const currentPolicy = policy();
+    const info = { id: 'control-id', projectID: 'project-id' };
+    const identity = deriveWorkspaceIdentity(info, 'kubernetes');
+    const refs = canonicalResourceRefs(identity.providerResourceID, 'kubernetes', currentPolicy);
+    const manifests = buildManifests({ identity, refs, image: currentPolicy.defaultImage, policy: currentPolicy, token: 'endpoint-secret', modelAuth: '{"key":"model-secret"}', workspaceID: info.id });
+    const kinds = manifests.infrastructure.map((item) => item.kind);
+    expect(kinds).toEqual(expect.arrayContaining(['Secret', 'ServiceAccount', 'PersistentVolumeClaim', 'NetworkPolicy']));
+    expect(manifests.infrastructure.filter((item) => item.kind === 'PersistentVolumeClaim')).toHaveLength(2);
+    const networkPolicy = manifests.infrastructure.find((item) => item.kind === 'NetworkPolicy');
+    expect(networkPolicy.spec.policyTypes).toEqual(['Ingress', 'Egress']);
+    expect(networkPolicy.spec.ingress).toEqual([]);
+    const podSpec = manifests.deployment.spec.template.spec;
+    expect(podSpec.automountServiceAccountToken).toBe(false);
+    expect(podSpec.securityContext.seccompProfile.type).toBe('RuntimeDefault');
+    expect(podSpec.securityContext.fsGroupChangePolicy).toBe('OnRootMismatch');
+    expect(manifests.seedPod.spec.securityContext.fsGroupChangePolicy).toBe('OnRootMismatch');
+    expect(podSpec.containers[0].securityContext).toMatchObject({ allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ['ALL'] } });
+    expect(podSpec.containers[0]).toHaveProperty('startupProbe');
+    expect(podSpec.containers[0]).toHaveProperty('readinessProbe');
+    expect(podSpec.containers[0]).toHaveProperty('livenessProbe');
+    expect(podSpec.containers[0].env).toContainEqual({ name: 'OPENCHAMBER_WORKSPACE_AUTH_TOKEN_FILE', value: '/var/run/openchamber-workspace/endpoint-token' });
+    expect(podSpec.containers[0].startupProbe.exec.command.join(' ')).toContain('/var/run/openchamber-workspace/endpoint-token');
+    expect(podSpec.containers[0].env.some((item) => item.name === 'OPENCODE_AUTH_CONTENT')).toBe(false);
+    expect(JSON.stringify(manifests.deployment)).not.toContain('model-secret');
   });
 
-  it('rejects default-deny creation without explicit proxy and DNS egress', async () => {
-    const policy = readPolicy({ defaultImage: 'workspace-image:1.0.0', requirePinnedImage: false });
-    const provider = createKubernetesProvider({ policy, sourceDirectory: '/source' });
-    const info = provider.configure({ id: 'ws_1', projectID: 'project:1' });
+  it('uses canonical metadata and requires complete ingress policy', () => {
+    const currentPolicy = policy();
+    const provider = createKubernetesProvider({ policy: currentPolicy, sourceDirectory: '/source' });
+    const info = provider.configure({ id: 'control-id', projectID: 'project-id' });
+    expect(info.extra.resourceRefs.baselinePVC).toMatch(/baseline$/);
+    expect(() => readPolicy({ kubernetes: { connectivity: 'ingress' } })).toThrow(/complete ingress policy/);
+    expect(() => readPolicy({ kubernetes: { networkPolicy: 'disabled' } })).toThrow(/cannot be disabled/);
+  });
 
-    await expect(provider.create(info, { OPENCODE_AUTH_CONTENT: '{}' })).rejects.toThrow(/require.*egress/i);
-    expect(processMocks.run).not.toHaveBeenCalled();
+  it('builds HTTPS ingress and controller-scoped NetworkPolicy', () => {
+    const currentPolicy = readPolicy({
+      defaultImage: 'workspace-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      egress: { mode: 'external', proxyUrl: 'http://10.0.0.10:3128', proxyCIDR: '10.0.0.10/32', dnsCIDRs: ['10.0.0.53/32'] },
+      kubernetes: { connectivity: 'ingress', ingress: { ingressClassName: 'nginx', hostTemplate: '{resourceID}.workspaces.example.com', pathTemplate: '/', tls: { mode: 'existing-secret', secretName: 'workspace-tls' }, controllerNamespaceSelector: { 'kubernetes.io/metadata.name': 'ingress-nginx' }, controllerPodSelector: { 'app.kubernetes.io/name': 'ingress-nginx' }, annotations: { 'nginx.ingress.kubernetes.io/proxy-read-timeout': '3600' } } },
+    });
+    const info = { id: 'control-id', projectID: 'project-id' };
+    const identity = deriveWorkspaceIdentity(info, 'kubernetes');
+    const refs = canonicalResourceRefs(identity.providerResourceID, 'kubernetes', currentPolicy);
+    const manifests = buildManifests({ identity, refs, image: currentPolicy.defaultImage, policy: currentPolicy, token: 'token', workspaceID: info.id });
+    const ingress = manifests.infrastructure.find((item) => item.kind === 'Ingress');
+    expect(ingress.spec.tls[0].hosts[0]).toBe(`${identity.providerResourceID}.workspaces.example.com`);
+    expect(ingress.spec.rules[0].http.paths[0].backend.service.name).toBe(refs.service);
+    const runtimePolicy = manifests.infrastructure.find((item) => item.kind === 'NetworkPolicy' && item.metadata.name === refs.networkPolicy);
+    expect(runtimePolicy.spec.ingress[0].from[0]).toMatchObject({ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'ingress-nginx' } }, podSelector: { matchLabels: { 'app.kubernetes.io/name': 'ingress-nginx' } } });
+  });
+
+  it('builds an isolated managed gateway and routes runtime proxy traffic only through it', () => {
+    const currentPolicy = readPolicy({
+      defaultImage: 'workspace-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      egress: { mode: 'managed', gatewayImage: 'gateway@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', preset: 'custom', allowedDomains: ['api.example.com'], dnsCIDRs: ['10.0.0.53/32'] },
+    });
+    const info = { id: 'control-id', projectID: 'project-id' };
+    const identity = deriveWorkspaceIdentity(info, 'kubernetes');
+    const refs = canonicalResourceRefs(identity.providerResourceID, 'kubernetes', currentPolicy);
+    const manifests = buildManifests({ identity, refs, image: currentPolicy.defaultImage, policy: currentPolicy, token: 'token', workspaceID: info.id });
+    const gateway = manifests.infrastructure.find((item) => item.kind === 'Deployment' && item.metadata.name === refs.gatewayDeployment);
+    expect(gateway.spec.template.spec.containers[0]).toMatchObject({ image: currentPolicy.egress.gatewayImage, securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false } });
+    expect(gateway.spec.template.spec.containers[0].volumeMounts).toBeUndefined();
+    const runtimeProxy = manifests.deployment.spec.template.spec.containers[0].env.find((item) => item.name === 'HTTPS_PROXY');
+    expect(runtimeProxy.value).toBe(`http://${refs.gatewayService}:3128`);
+    const gatewayPolicy = manifests.infrastructure.find((item) => item.kind === 'NetworkPolicy' && item.metadata.name === refs.gatewayNetworkPolicy);
+    expect(gatewayPolicy.spec.podSelector.matchLabels['openchamber.io/role']).toBe('egress-gateway');
+    expect(gatewayPolicy.spec.egress).toContainEqual(expect.objectContaining({
+      to: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' } }, podSelector: { matchLabels: { 'k8s-app': 'kube-dns' } } }],
+    }));
   });
 });

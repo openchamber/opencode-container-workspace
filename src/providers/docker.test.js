@@ -1,159 +1,113 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { canonicalWorkspaceLabelID } from '../label-id.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-const processMocks = vi.hoisted(() => ({
-  commandExists: vi.fn(() => true),
-  run: vi.fn(),
-  runJson: vi.fn(),
-}));
-
-const authMocks = vi.hoisted(() => ({
-  createWorkspaceToken: vi.fn(async (id) => ({ token: `token-${id}` })),
-  deleteWorkspaceToken: vi.fn(async () => undefined),
-  getWorkspaceToken: vi.fn(async () => 'runtime-token'),
-}));
-
-const healthMocks = vi.hoisted(() => ({
-  waitForHttpHealth: vi.fn(async () => undefined),
-}));
-
-vi.mock('../process.js', async (importOriginal) => {
-  const actual = await importOriginal();
-  return {
-    ...actual,
-    commandExists: processMocks.commandExists,
-    run: processMocks.run,
-    runJson: processMocks.runJson,
-  };
-});
-
-vi.mock('../auth.js', async (importOriginal) => {
-  const actual = await importOriginal();
-  return { ...actual, ...authMocks };
-});
-
-vi.mock('../health.js', () => healthMocks);
-
+const processMocks = vi.hoisted(() => ({ commandExists: vi.fn(() => true), run: vi.fn(), runJson: vi.fn() }));
+vi.mock('../process.js', async (importOriginal) => ({ ...await importOriginal(), ...processMocks }));
 const { readPolicy } = await import('../policy.js');
-const { SECURE_DOCKER_NETWORK } = await import('../policy.js');
 const { createDockerProvider } = await import('./docker.js');
 
-describe('docker workspace provider ownership guards', () => {
-  beforeEach(() => {
+describe('Docker provider security and transactions', () => {
+  let stateDirectory;
+  beforeEach(async () => {
+    stateDirectory = await mkdtemp(join(tmpdir(), 'workspace-docker-test-'));
+    process.env.OPENCHAMBER_WORKSPACE_STATE_DIR = stateDirectory;
     processMocks.commandExists.mockReturnValue(true);
-    processMocks.run.mockReset();
-    processMocks.run.mockResolvedValue({ stdout: '', stderr: '' });
-    processMocks.runJson.mockReset();
-    authMocks.getWorkspaceToken.mockClear();
-    authMocks.deleteWorkspaceToken.mockClear();
-    healthMocks.waitForHttpHealth.mockClear();
+    processMocks.run.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
+    processMocks.runJson.mockReset().mockRejectedValue(new Error('not found'));
+  });
+  afterEach(async () => {
+    delete process.env.OPENCHAMBER_WORKSPACE_STATE_DIR;
+    await rm(stateDirectory, { recursive: true, force: true });
   });
 
-  function createConfiguredWorkspace(id = 'ws:1/abc') {
-    const policy = readPolicy({
-      defaultImage: 'workspace-image:1.0.0',
-      requirePinnedImage: false,
-      egress: { httpProxy: 'http://proxy.openchamber:3128', noProxy: '127.0.0.1,localhost' },
-    });
-    const provider = createDockerProvider({ policy, sourceDirectory: '/source' });
-    const info = provider.configure({ id, projectID: 'project:1' });
-    expect(info.extra.labels['openchamber.workspace.id']).toBe(canonicalWorkspaceLabelID(id));
-    const labels = info.extra.labels;
-    return { provider, info, labels };
+  function configured(sourceDirectory = '/source') {
+    const policy = readPolicy({ defaultImage: 'workspace-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', egress: { mode: 'external', proxyUrl: 'http://proxy:3128' }, credentials: { modelAuth: 'explicit-opencode-auth-content' } });
+    const provider = createDockerProvider({ policy, sourceDirectory });
+    return { policy, provider, info: provider.configure({ id: 'control-plane-id', projectID: 'project-id' }) };
   }
 
-  it.each(['ws_1', 'ws:1/abc'])('targets workspace ID %s using canonical labels', async (id) => {
-    const { provider, info, labels } = createConfiguredWorkspace(id);
-    processMocks.runJson
-      .mockResolvedValueOnce([{ Config: { Labels: labels } }])
-      .mockResolvedValueOnce([{
-        State: { Running: true },
-        NetworkSettings: { Ports: { '4096/tcp': [{ HostPort: '49123' }] } },
-      }]);
+  function configuredWithProxy(proxyUrl, sourceDirectory) {
+    const policy = readPolicy({ defaultImage: 'workspace-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', egress: { mode: 'external', proxyUrl } });
+    const provider = createDockerProvider({ policy, sourceDirectory });
+    return { provider, info: provider.configure({ id: 'control-plane-id', projectID: 'project-id' }) };
+  }
 
-    await expect(provider.target(info)).resolves.toEqual({
-      type: 'remote',
-      url: 'http://127.0.0.1:49123',
-      headers: { 'x-openchamber-workspace-token': 'runtime-token' },
+  it('uses opaque provider identity and canonical per-workspace resources without trusted labels in metadata', () => {
+    const { info } = configured();
+    expect(info.extra).toMatchObject({ version: 1, provider: 'docker', controlPlaneWorkspaceID: 'control-plane-id', projectID: 'project-id', runtimeLayoutVersion: 1 });
+    expect(info.extra.providerResourceID).toMatch(/^ws-[a-f0-9]{32}$/);
+    expect(info.extra.resourceRefs.network).toContain(info.extra.providerResourceID);
+    expect(info.extra.resourceRefs.baselineVolume).toMatch(/baseline$/);
+    expect(info.extra).not.toHaveProperty('labels');
+    expect(info.extra).not.toHaveProperty('policy');
+  });
+
+  it('rejects metadata resource-name tampering before provider commands', async () => {
+    const { provider, info } = configured();
+    const tampered = { ...info, extra: { ...info.extra, resourceRefs: { ...info.extra.resourceRefs, runtime: 'foreign' } } };
+    await expect(provider.target(tampered)).rejects.toThrow(/not canonical/);
+    expect(processMocks.runJson).not.toHaveBeenCalled();
+  });
+
+  it('rolls back only resources created by the failed operation and never injects broad auth as environment', async () => {
+    const sourceDirectory = join(stateDirectory, 'source');
+    await mkdir(sourceDirectory);
+    const { provider, info } = configured(sourceDirectory);
+    processMocks.run.mockImplementation(async (_binary, args) => {
+      if (args[0] === 'volume' && args[1] === 'create' && args.at(-1).endsWith('-baseline')) throw new Error('baseline create failed');
+      return { stdout: '', stderr: '' };
     });
+    await expect(provider.create(info, { OPENCODE_AUTH_CONTENT: '{"provider":"secret"}' })).rejects.toThrow(/baseline create failed/);
+    const commands = processMocks.run.mock.calls.map(([, args]) => args);
+    expect(commands).toContainEqual(expect.arrayContaining(['network', 'rm', info.extra.resourceRefs.network]));
+    expect(commands).toContainEqual(expect.arrayContaining(['volume', 'rm', info.extra.resourceRefs.mutableVolume]));
+    expect(commands).not.toContainEqual(expect.arrayContaining(['rm', '-f', info.extra.resourceRefs.runtime]));
+    expect(JSON.stringify(commands)).not.toContain('provider\\":\\"secret');
+    expect(JSON.stringify(commands)).not.toContain('OPENCODE_AUTH_CONTENT=');
   });
 
-  it.each(['ws_1', 'ws:1/abc'])('exports workspace ID %s using canonical labels', async (id) => {
-    const { provider, info, labels } = createConfiguredWorkspace(id);
-    processMocks.runJson.mockResolvedValueOnce([{ Config: { Labels: labels } }]);
-    processMocks.run.mockResolvedValueOnce({ stdout: 'diff --git a/a b/a\n', stderr: '' });
-
-    await expect(provider.exportDiff(info)).resolves.toEqual({ patch: 'diff --git a/a b/a\n', provider: 'docker' });
-  });
-
-  it.each(['ws_1', 'ws:1/abc'])('removes workspace ID %s using canonical labels', async (id) => {
-    const { provider, info, labels } = createConfiguredWorkspace(id);
-    processMocks.runJson
-      .mockResolvedValueOnce([{ Config: { Labels: labels } }])
-      .mockResolvedValueOnce([{ Labels: labels }]);
-
-    await expect(provider.remove(info)).resolves.toBeUndefined();
-
-    expect(processMocks.run).toHaveBeenCalledWith('docker', ['rm', '-f', info.extra.runtime.container], expect.any(Object));
-    expect(processMocks.run).toHaveBeenCalledWith('docker', ['volume', 'rm', info.extra.storage.volume], expect.any(Object));
-    expect(authMocks.deleteWorkspaceToken).toHaveBeenCalledWith(info.extra.auth.tokenRef);
-  });
-
-  it('reconstructs listed workspaces with the same token ref after restart', async () => {
-    const { provider, info, labels } = createConfiguredWorkspace('ws:1/abc');
-    processMocks.run.mockResolvedValueOnce({
-      stdout: `${JSON.stringify({ Names: info.extra.runtime.container, Labels: Object.entries(labels).map(([key, value]) => `${key}=${value}`).join(',') })}\n`,
-      stderr: '',
+  it('runs short-lived seed helpers as the unprivileged runtime user', async () => {
+    const sourceDirectory = join(stateDirectory, 'source');
+    await mkdir(sourceDirectory);
+    const { provider, info } = configured(sourceDirectory);
+    processMocks.run.mockImplementation(async (_binary, args) => {
+      if (args[0] === 'run' && args.includes('-d') && args.includes(info.extra.resourceRefs.runtime)) throw new Error('runtime create failed');
+      return { stdout: '', stderr: '' };
     });
 
-    const listed = await provider.list({ instance: { project: { id: 'project:1' } } });
+    await expect(provider.create(info)).rejects.toThrow(/runtime create failed/);
 
-    expect(listed).toHaveLength(1);
-    expect(listed[0].extra.auth.tokenRef).toBe(info.extra.auth.tokenRef);
-    expect(listed[0].extra.runtime.container).toBe(info.extra.runtime.container);
-    expect(listed[0].extra.storage.volume).toBe(info.extra.storage.volume);
-  });
-
-  it('creates the default owned internal network and starts the runtime container on it', async () => {
-    const { provider, info, labels } = createConfiguredWorkspace('ws_1');
-    processMocks.runJson
-      .mockRejectedValueOnce(new Error('network not found'))
-      .mockResolvedValueOnce([{ Config: { Labels: labels } }])
-      .mockResolvedValueOnce([{
-        State: { Running: true },
-        NetworkSettings: { Ports: { '4096/tcp': [{ HostPort: '49123' }] } },
-      }]);
-
-    await provider.create(info, { OPENCODE_AUTH_CONTENT: '{}' });
-
-    expect(processMocks.run).toHaveBeenCalledWith('docker', expect.arrayContaining([
-      'network', 'create', '--driver', 'bridge', '--internal', SECURE_DOCKER_NETWORK,
-    ]), expect.any(Object));
-    const runtimeRun = processMocks.run.mock.calls.find(([, args]) => args[0] === 'run' && args.includes('-d'));
-    expect(runtimeRun?.[1]).toContain('--network');
-    expect(runtimeRun?.[1]).toContain(SECURE_DOCKER_NETWORK);
-    expect(runtimeRun?.[1]).toContain('-e');
-    expect(runtimeRun?.[1]).toContain('HTTPS_PROXY=http://proxy.openchamber:3128');
-    const helperRuns = processMocks.run.mock.calls.filter(([, args]) => args[0] === 'run' && args.includes('--rm') && !args.includes('-d'));
-    expect(helperRuns).toHaveLength(2);
-    expect(helperRuns[0]?.[1]).toContain('-i');
-    for (const [, args] of helperRuns) {
-      expect(args).toContain('--network');
-      expect(args).toContain('none');
-      expect(args).toContain('--security-opt');
-      expect(args).toContain('no-new-privileges');
-      expect(args).toContain('--cap-drop');
-      expect(args).toContain('ALL');
+    const helperCommands = processMocks.run.mock.calls
+      .map(([, args]) => args)
+      .filter((args) => args[0] === 'run' && args.includes('--network') && args.includes('none'));
+    expect(helperCommands.length).toBeGreaterThanOrEqual(2);
+    for (const command of helperCommands) {
+      expect(command).toEqual(expect.arrayContaining(['--user', '1000:1000', '--network', 'none', '--cap-drop', 'ALL']));
+      expect(command).not.toContain('--cap-add');
     }
-    expect(healthMocks.waitForHttpHealth).toHaveBeenCalledWith('http://127.0.0.1:49123', { 'x-openchamber-workspace-token': 'runtime-token' });
+    const runtimeCommand = processMocks.run.mock.calls.map(([, args]) => args).find((args) => args.includes(info.extra.resourceRefs.runtime) && args.includes('-d'));
+    expect(runtimeCommand).toEqual(expect.arrayContaining(['--read-only', '--tmpfs', '/tmp:rw,exec,nosuid,size=256m']));
+    expect(runtimeCommand.some((arg) => arg.startsWith('OPENCODE_WORKSPACE_ID='))).toBe(false);
+    expect(processMocks.runJson.mock.calls.every(([, args]) => args[0] !== 'inspect' || args[1] !== 'inspect')).toBe(true);
   });
 
-  it('rejects default secure network creation without an explicit egress proxy', async () => {
-    const policy = readPolicy({ defaultImage: 'workspace-image:1.0.0', requirePinnedImage: false });
-    const provider = createDockerProvider({ policy, sourceDirectory: '/source' });
-    const info = provider.configure({ id: 'ws_1', projectID: 'project:1' });
+  it('uses verified TLS for HTTPS external proxies and preserves idle upgraded streams', async () => {
+    const sourceDirectory = join(stateDirectory, 'source');
+    await mkdir(sourceDirectory);
+    const { provider, info } = configuredWithProxy('https://proxy.example.com:8443', sourceDirectory);
 
-    await expect(provider.create(info, { OPENCODE_AUTH_CONTENT: '{}' })).rejects.toThrow(/require.*egress/i);
-    expect(processMocks.run).not.toHaveBeenCalled();
+    await expect(provider.create(info)).rejects.toThrow(/not found/);
+    const gateway = processMocks.run.mock.calls.map(([, args]) => args).find((args) => args.includes(info.extra.resourceRefs.gateway) && args.includes('OPENCHAMBER_PROXY_TLS=true'));
+    expect(gateway).toEqual(expect.arrayContaining([
+      'OPENCHAMBER_PROXY_HOST=proxy.example.com', 'OPENCHAMBER_PROXY_PORT=8443',
+      'OPENCHAMBER_PROXY_TLS=true', 'OPENCHAMBER_PROXY_SERVERNAME=proxy.example.com',
+    ]));
+    const bridge = gateway.at(-1);
+    expect(bridge).toContain("tls.connect({host,port,servername:net.isIP(servername)?undefined:servername}");
+    expect(bridge).toContain("u.once(secure?'secureConnect':'connect',()=>u.setTimeout(0))");
+    const access = processMocks.run.mock.calls.map(([, args]) => args).find((args) => args.includes(info.extra.resourceRefs.access));
+    expect(access.at(-1)).toContain('upstream.setTimeout(0)');
   });
 });

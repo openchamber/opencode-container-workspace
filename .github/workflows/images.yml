@@ -1,0 +1,211 @@
+name: Workspace Images
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun install --frozen-lockfile
+      - run: bun run test
+      - run: bun run lint
+      - run: bun run type-check
+      - run: npm pack --dry-run
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: opencode-workspace
+            dockerfile: runtime-image/Dockerfile
+          - name: workspace-egress-gateway
+            dockerfile: egress-image/Dockerfile
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Resolve immutable base image
+        id: base
+        shell: bash
+        run: |
+          digest="$(docker buildx imagetools inspect node:22-bookworm-slim --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          test -n "$digest"
+          echo "image=node@${digest}" >> "$GITHUB_OUTPUT"
+      - name: Build multi-architecture OCI archive with SBOM and provenance
+        run: |
+          docker buildx build . \
+            --file "${{ matrix.dockerfile }}" \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "NODE_BASE_IMAGE=${{ steps.base.outputs.image }}" \
+            --sbom=true \
+            --provenance=mode=max \
+            --output "type=oci,dest=/tmp/${{ matrix.name }}.tar"
+      - name: Per-architecture runtime smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          cid=""
+          cleanup() { if [ -n "$cid" ]; then docker rm -f "$cid" >/dev/null 2>&1 || true; fi; }
+          trap cleanup EXIT
+          for platform in linux/amd64 linux/arm64; do
+            arch="${platform#linux/}"
+            docker buildx build . --file "${{ matrix.dockerfile }}" --platform "$platform" --build-arg "NODE_BASE_IMAGE=${{ steps.base.outputs.image }}" --load --tag "workspace-smoke:${{ matrix.name }}-$arch"
+            if [ "${{ matrix.name }}" = "opencode-workspace" ]; then
+              docker run --rm "workspace-smoke:${{ matrix.name }}-$arch" opencode --version
+              cid="$(docker run -d -p 127.0.0.1::4096 "workspace-smoke:${{ matrix.name }}-$arch" opencode serve --hostname 0.0.0.0 --port 4096)"
+              binding="$(docker port "$cid" 4096/tcp)"
+              port="${binding##*:}"
+              ready=false
+              for attempt in $(seq 1 60); do
+                if node -e "fetch('http://127.0.0.1:${port}/global/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then ready=true; break; fi
+                sleep 1
+              done
+              docker rm -f "$cid"
+              cid=""
+              test "$ready" = true
+            else
+              docker run --rm --entrypoint node "workspace-smoke:${{ matrix.name }}-$arch" --check /app/gateway.mjs
+              cid="$(docker run -d -p 127.0.0.1::3128 -e OPENCHAMBER_RESOURCE_ID=smoke -e 'OPENCHAMBER_EGRESS_POLICY={"version":1,"allowedDomains":["example.com"],"allowedCIDRs":[],"allowedPorts":[80,443]}' "workspace-smoke:${{ matrix.name }}-$arch")"
+              binding="$(docker port "$cid" 3128/tcp)"
+              port="${binding##*:}"
+              ready=false
+              for attempt in $(seq 1 30); do
+                if node -e "const net=require('node:net');const s=net.connect(${port},'127.0.0.1',()=>{s.destroy();process.exit(0)});s.on('error',()=>process.exit(1))"; then ready=true; break; fi
+                sleep 1
+              done
+              docker rm -f "$cid"
+              cid=""
+              test "$ready" = true
+            fi
+          done
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+      - name: Vulnerability gate
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            trivy image --input "/tmp/${{ matrix.name }}.tar" --platform "$platform" --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+          done
+
+  docker-live:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: Resolve immutable base image
+        id: base
+        shell: bash
+        run: |
+          digest="$(docker buildx imagetools inspect node:22-bookworm-slim --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          test -n "$digest"
+          echo "image=node@$digest" >> "$GITHUB_OUTPUT"
+      - run: bun install --frozen-lockfile
+      - name: Build native integration images
+        run: |
+          docker build . --file runtime-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${{ steps.base.outputs.image }}" --tag workspace-integration/runtime:latest
+          docker build . --file egress-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${{ steps.base.outputs.image }}" --tag workspace-integration/gateway:latest
+      - name: Resolve integration image digests
+        id: integration-images
+        shell: bash
+        run: |
+          runtime="$(docker image inspect workspace-integration/runtime:latest --format '{{.Id}}')"
+          gateway="$(docker image inspect workspace-integration/gateway:latest --format '{{.Id}}')"
+          echo "runtime=${runtime#sha256:}" >> "$GITHUB_OUTPUT"
+          echo "gateway=${gateway#sha256:}" >> "$GITHUB_OUTPUT"
+      - name: Run live Docker provider lifecycle
+        env:
+          OPENCHAMBER_DOCKER_WORKSPACE_INTEGRATION_IMAGE: workspace-integration/runtime@sha256:${{ steps.integration-images.outputs.runtime }}
+          OPENCHAMBER_DOCKER_WORKSPACE_INTEGRATION_GATEWAY_IMAGE: workspace-integration/gateway@sha256:${{ steps.integration-images.outputs.gateway }}
+        run: bunx vitest run src/providers/docker.integration.test.js
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, image, docker-live]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: opencode-workspace
+            dockerfile: runtime-image/Dockerfile
+          - name: workspace-egress-gateway
+            dockerfile: egress-image/Dockerfile
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Resolve immutable base image
+        id: base
+        shell: bash
+        run: |
+          digest="$(docker buildx imagetools inspect node:22-bookworm-slim --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          test -n "$digest"
+          echo "image=node@${digest}" >> "$GITHUB_OUTPUT"
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+      - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build immutable release candidate
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${{ matrix.name }}"
+          candidate="$image:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker buildx build . \
+            --file "${{ matrix.dockerfile }}" \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "NODE_BASE_IMAGE=${{ steps.base.outputs.image }}" \
+            --sbom=true --provenance=mode=max \
+            --tag "$candidate" --push --metadata-file /tmp/candidate-metadata.json
+          digest="$(node -e 'const v=require("/tmp/candidate-metadata.json");process.stdout.write(v["containerimage.digest"])')"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "reference=$image@$digest" >> "$GITHUB_OUTPUT"
+      - name: Vulnerability gate on exact candidate digest
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            trivy image "${{ steps.candidate.outputs.reference }}" --platform "$platform" --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+          done
+      - name: Promote verified digest to release tag
+        id: publish
+        shell: bash
+        run: |
+          image="${{ steps.candidate.outputs.image }}"
+          digest="${{ steps.candidate.outputs.digest }}"
+          version="${GITHUB_REF_NAME#v}"
+          docker buildx imagetools create --tag "$image:$version" "$image@$digest"
+          echo "reference=$image@$digest" >> "$GITHUB_OUTPUT"
+      - name: Keyless sign image digest
+        run: cosign sign --yes "${{ steps.publish.outputs.reference }}"
+      - name: Verify signature and unauthenticated public pull
+        run: |
+          cosign verify "${{ steps.publish.outputs.reference }}" \
+            --certificate-identity-regexp '^https://github.com/.+/.github/workflows/images.yml@refs/tags/v.+' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          docker logout ghcr.io
+          docker buildx imagetools inspect "${{ steps.publish.outputs.reference }}"
+          docker pull "${{ steps.publish.outputs.reference }}"

@@ -7,25 +7,41 @@
   },
   "type": "module",
   "main": "./src/plugin.js",
+  "types": "./src/plugin.d.ts",
   "exports": {
-    ".": "./src/plugin.js",
-    "./label-id": "./src/label-id.js",
-    "./policy": "./src/policy.js"
+    ".": {
+      "types": "./src/plugin.d.ts",
+      "import": "./src/plugin.js"
+    },
+    "./operations": {
+      "types": "./src/operations.d.ts",
+      "import": "./src/operations.js"
+    },
+    "./contracts": {
+      "types": "./src/contracts.d.ts",
+      "import": "./src/contracts.js"
+    }
   },
   "scripts": {
-    "build": "node --check src/plugin.js && node --check src/label-id.js && node --check src/process.js && node --check src/metadata.js && node --check src/runtime-command.js && node --check src/providers/docker.js && node --check src/providers/kubernetes.js && node --check src/providers/apple-container.js",
-    "type-check": "bun run build",
+    "build": "node --check src/plugin.js && node --check src/transport-shim.js && node --check src/contracts.js && node --check src/operations.js && node --check src/artifact.js && node --check src/snapshot.js && node --check src/egress-gateway.js && node --check src/label-id.js && node --check src/process.js && node --check src/state-store.js && node --check src/lifecycle.js && node --check src/metadata.js && node --check src/runtime-command.js && node --check src/providers/docker.js && node --check src/providers/kubernetes.js && node --check src/providers/apple-container.js",
+    "type-check": "tsc --noEmit",
     "lint": "bun run build",
     "test": "vitest run"
   },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.4"
+  },
   "devDependencies": {
+    "typescript": "5.9.3",
     "vitest": "^4.1.5",
     "ws": "^8.18.3"
   },
   "files": [
     "src/**/*.js",
+    "src/**/*.d.ts",
     "!src/**/*.test.js",
     "runtime-image/**",
+    "egress-image/**",
     "package.json",
     "README.md",
     "LICENSE"

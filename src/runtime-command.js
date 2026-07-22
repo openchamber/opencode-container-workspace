@@ -1,16 +1,21 @@
 import { WORKSPACE_RUNTIME } from './metadata.js';
+import { AUTH_HEADER, AUTH_SECRET_NAME } from './auth.js';
 
 const RUNTIME_PROXY_PORT = WORKSPACE_RUNTIME.port;
 const RUNTIME_OPENCODE_PORT = WORKSPACE_RUNTIME.port + 1;
 export const RUNTIME_TOKEN_FILE = `${WORKSPACE_RUNTIME.directory}/.openchamber/token`;
+export const PROVIDER_SECRET_DIRECTORY = '/run/openchamber-workspace';
+export const PROVIDER_TOKEN_FILE = `${PROVIDER_SECRET_DIRECTORY}/endpoint-token`;
+export const PROVIDER_MODEL_AUTH_FILE = `${PROVIDER_SECRET_DIRECTORY}/model-auth.json`;
 export const KUBERNETES_TOKEN_MOUNT_PATH = '/var/run/openchamber-workspace';
-export const KUBERNETES_TOKEN_FILE = `${KUBERNETES_TOKEN_MOUNT_PATH}/token`;
+export const KUBERNETES_TOKEN_FILE = `${KUBERNETES_TOKEN_MOUNT_PATH}/${AUTH_SECRET_NAME}`;
 export const BASELINE_COMMAND = `cd ${WORKSPACE_RUNTIME.directory} && if [ ! -d .git ]; then git init >/dev/null && git add . >/dev/null && git -c user.name=OpenChamber -c user.email=openchamber@example.invalid commit -m 'OpenChamber workspace baseline' >/dev/null; fi`;
 
 export const AUTH_PROXY_SCRIPT = String.raw`
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
+import crypto from 'node:crypto';
 
 const header = (process.env.OPENCHAMBER_WORKSPACE_AUTH_HEADER || '').toLowerCase();
 const tokenFile = process.env.OPENCHAMBER_WORKSPACE_AUTH_TOKEN_FILE;
@@ -24,7 +29,10 @@ function readToken() {
 
 function authorized(req) {
   const expected = readToken();
-  return Boolean(header && expected && req.headers[header] === expected);
+  const supplied = typeof req.headers[header] === 'string' ? req.headers[header] : '';
+  const expectedBuffer = Buffer.from(expected);
+  const suppliedBuffer = Buffer.from(supplied);
+  return Boolean(header && expected && expectedBuffer.length === suppliedBuffer.length && crypto.timingSafeEqual(expectedBuffer, suppliedBuffer));
 }
 
 function forwardedHeaders(req) {
@@ -81,12 +89,14 @@ server.on('upgrade', (req, socket, head) => {
 server.listen(listenPort, '0.0.0.0');
 `;
 
-export function runtimeCommand(tokenFile) {
+export function runtimeCommand(tokenFile, modelAuthFile = PROVIDER_MODEL_AUTH_FILE) {
   const proxyPath = '/tmp/openchamber-workspace-auth-proxy.mjs';
   return [
     `cat > ${proxyPath} <<'OPENCHAMBER_PROXY'`,
     AUTH_PROXY_SCRIPT,
     'OPENCHAMBER_PROXY',
+    'export HOME=/tmp/openchamber-home; mkdir -p "$HOME"',
+    `if [ -f ${modelAuthFile} ]; then export OPENCODE_AUTH_CONTENT="$(cat ${modelAuthFile})"; fi`,
     `opencode serve --hostname 127.0.0.1 --port ${RUNTIME_OPENCODE_PORT} &`,
     `exec node ${proxyPath}`,
   ].join('\n');
@@ -94,12 +104,12 @@ export function runtimeCommand(tokenFile) {
 
 export function runtimeEnvironment(meta, tokenFile) {
   const env = {
-    OPENCHAMBER_WORKSPACE_AUTH_HEADER: meta.auth.header,
+    OPENCHAMBER_WORKSPACE_AUTH_HEADER: AUTH_HEADER,
     OPENCHAMBER_WORKSPACE_AUTH_TOKEN_FILE: tokenFile,
     OPENCHAMBER_WORKSPACE_TARGET_PORT: String(RUNTIME_OPENCODE_PORT),
     OPENCHAMBER_WORKSPACE_LISTEN_PORT: String(RUNTIME_PROXY_PORT),
   };
-  const proxy = meta.policy?.egress?.httpProxy;
+  const proxy = meta.policy?.egress?.proxyUrl;
   if (proxy) {
     env.HTTP_PROXY = proxy;
     env.HTTPS_PROXY = proxy;

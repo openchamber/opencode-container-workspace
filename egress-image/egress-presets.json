@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "sets": {
+    "restricted": [
+      "api.anthropic.com",
+      "api.openai.com",
+      "api.github.com",
+      "github.com",
+      "*.githubusercontent.com",
+      "registry.npmjs.org"
+    ]
+  }
+}

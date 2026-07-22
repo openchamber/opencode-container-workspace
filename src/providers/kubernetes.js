@@ -1,92 +1,113 @@
-import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { createReadStream } from 'node:fs';
 import { createServer } from 'node:net';
-import { canonicalWorkspaceLabelID } from '../label-id.js';
-import { run, spawnBackground, sanitizeLabelValue } from '../process.js';
-import { ProviderUnavailableError } from '../errors.js';
-import { createExtra, readExtra, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
-import { createWorkspaceToken, deleteWorkspaceToken, getWorkspaceToken } from '../auth.js';
+import { run, runJson, spawnBackground } from '../process.js';
+import { CleanupError, OwnershipError, ProviderUnavailableError } from '../errors.js';
+import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
+import { createWorkspaceSecrets, getWorkspaceToken, rotateWorkspaceCredentials, selectGrantedCredentials } from '../auth.js';
 import { requireKubernetesEgress, validateImage } from '../policy.js';
 import { waitForHttpHealth } from '../health.js';
-import { BASELINE_COMMAND, KUBERNETES_TOKEN_FILE, KUBERNETES_TOKEN_MOUNT_PATH, runtimeCommand, runtimeEnvironment } from '../runtime-command.js';
+import { KUBERNETES_TOKEN_FILE, KUBERNETES_TOKEN_MOUNT_PATH, PROVIDER_MODEL_AUTH_FILE, runtimeCommand, runtimeEnvironment } from '../runtime-command.js';
+import { cleanupTransaction, createTransaction } from '../lifecycle.js';
+import { readWorkspaceState, writeWorkspaceState } from '../state-store.js';
+import { createSourceSnapshot } from '../snapshot.js';
+import { ARTIFACT_LIMITS, RUNTIME_ARTIFACT_SCRIPT } from '../artifact.js';
 
-const EXPORT_DIFF_COMMAND = 'tmp=$(mktemp); idx=$(git rev-parse --git-path index 2>/dev/null || true); if [ -n "$idx" ] && [ -f "$idx" ]; then cp "$idx" "$tmp"; fi; GIT_INDEX_FILE="$tmp" git add -N . >/dev/null 2>&1 || true; GIT_INDEX_FILE="$tmp" git diff --binary HEAD; code=$?; rm -f "$tmp"; exit $code';
+const portForwards = new Map();
+
+export const KUBERNETES_SEED_EXTRACT_COMMAND = `set -eu; cat > /tmp/source.tar; tar --no-same-owner --no-overwrite-dir --strip-components=1 -xf /tmp/source.tar -C "$1"; mkdir -p "$1/.openchamber-runtime"; printf '%s' "$2" > "$1/.openchamber-runtime/source-generation"`;
 
 export function createKubernetesProvider({ policy, sourceDirectory }) {
   const provider = 'kubernetes';
-
-  async function kubectl(args, options = {}) {
-    const base = [];
-    if (policy.kubernetes.context) base.push('--context', policy.kubernetes.context);
-    return run('kubectl', [...base, ...args], options);
-  }
+  const kubectl = (args, options = {}) => run('kubectl', [...contextArgs(policy), ...args], options);
 
   async function preflight() {
     requireKubernetesEgress(policy);
-    await kubectl(['version', '--client=true'], { timeoutMs: 15_000 }).catch((error) => {
-      throw new ProviderUnavailableError('kubectl is not available', { provider, cause: error });
-    });
-    for (const [verb, resource] of requiredKubernetesPermissions(policy)) {
-      await assertCanI(kubectl, verb, resource, policy.kubernetes.namespace);
+    await kubectl(['version', '--client=true'], { timeoutMs: 15_000 }).catch((cause) => { throw new ProviderUnavailableError('kubectl is not available', { provider, cause }); });
+    await kubectl(['get', 'namespace', policy.kubernetes.namespace, '-o', 'name'], { timeoutMs: 20_000 });
+    for (const [verb, resource] of requiredPermissions(policy)) {
+      const { stdout } = await kubectl(['auth', 'can-i', verb, resource, '-n', policy.kubernetes.namespace], { timeoutMs: 20_000 });
+      if (stdout.trim() !== 'yes') throw new ProviderUnavailableError(`Kubernetes RBAC denies ${verb} ${resource} in namespace ${policy.kubernetes.namespace}`, { provider });
     }
+    if (policy.kubernetes.connectivity === 'ingress') {
+      await kubectl(['get', 'ingressclass', policy.kubernetes.ingress.ingressClassName, '-o', 'name'], { timeoutMs: 20_000 });
+      if (policy.kubernetes.ingress.tls.mode === 'existing-secret') await kubectl(['get', 'secret', policy.kubernetes.ingress.tls.secretName, '-n', policy.kubernetes.namespace, '-o', 'name'], { timeoutMs: 20_000 });
+      const namespaceSelector = selectorString(policy.kubernetes.ingress.controllerNamespaceSelector);
+      const podSelector = selectorString(policy.kubernetes.ingress.controllerPodSelector);
+      const namespaces = JSON.parse((await kubectl(['get', 'namespaces', '-l', namespaceSelector, '-o', 'json'], { timeoutMs: 30_000 })).stdout).items ?? [];
+      if (namespaces.length === 0) throw new ProviderUnavailableError('Kubernetes ingress controller namespace selector matches no namespaces', { provider });
+      const namespaceNames = new Set(namespaces.map((item) => item.metadata?.name));
+      const pods = JSON.parse((await kubectl(['get', 'pods', '--all-namespaces', '-l', podSelector, '-o', 'json'], { timeoutMs: 30_000 })).stdout).items ?? [];
+      if (!pods.some((item) => namespaceNames.has(item.metadata?.namespace))) throw new ProviderUnavailableError('Kubernetes ingress controller selectors match no pods', { provider });
+    }
+    return { provider, available: true, diagnostics: [] };
   }
 
   function configure(info) {
-    const id = canonicalWorkspaceLabelID(info.id);
-    const image = validateImage(policy, info.extra?.image ?? policy.defaultImage);
-    const name = workspaceName(info, provider);
-    const resourceName = kubernetesResourceName('openchamber-ws', info.id);
-    const extra = createExtra(info, provider, { ...policy, defaultImage: image }, {
-      storage: { type: 'kubernetes-pvc', namespace: policy.kubernetes.namespace, pvc: resourceName },
-      runtime: {
-        type: 'kubernetes-deployment',
-        namespace: policy.kubernetes.namespace,
-        deployment: resourceName,
-        service: resourceName,
-        secret: kubernetesResourceName(`${resourceName}-auth`, id),
-        networkPolicy: resourceName,
-        connectivity: policy.kubernetes.connectivity,
-      },
-    });
-    return { ...info, name, directory: WORKSPACE_RUNTIME.directory, extra };
+    const identity = deriveWorkspaceIdentity(info, provider);
+    const image = validateImage(policy, policy.defaultImage);
+    const refs = canonicalResourceRefs(identity.providerResourceID, provider, policy);
+    return { ...info, name: workspaceName(identity.providerResourceID, provider), directory: WORKSPACE_RUNTIME.directory, extra: createMetadata(info, provider, { ...policy, defaultImage: image }, refs, identity) };
   }
 
-  async function create(info, env) {
+  async function create(info, env = {}) {
     await preflight();
-    const meta = readExtra(info, provider);
-    const image = validateImage(policy, meta.image);
-    const tokenInfo = await createWorkspaceToken(info.id);
-    try {
-      await applyManifest(buildManifest(meta, image, tokenInfo.token, env));
-      await kubectl(['rollout', 'status', `deployment/${meta.runtime.deployment}`, '-n', meta.runtime.namespace, '--timeout=120s'], { timeoutMs: 150_000 });
-      await seedWorkspace(meta, sourceDirectory, policy);
-      await initializeWorkspaceBaseline(meta, policy);
-      await kubectl(['rollout', 'restart', `deployment/${meta.runtime.deployment}`, '-n', meta.runtime.namespace], { timeoutMs: 60_000 });
-      await kubectl(['rollout', 'status', `deployment/${meta.runtime.deployment}`, '-n', meta.runtime.namespace, '--timeout=120s'], { timeoutMs: 150_000 });
+    const meta = readMetadata(info, provider, policy);
+    const identity = identityFromMetadata(meta);
+    const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
+    const image = validateImage(policy, meta.imageDigest);
+    await createTransaction(identity, async (transaction) => {
+      const sourceSnapshot = await createSourceSnapshot(sourceDirectory);
+      try {
+      if (!transaction.recovering) await assertResourcesAbsent(kubectl, refs);
+      await transaction.bindSnapshot(sourceSnapshot.generation);
+      const grantedCredentials = selectGrantedCredentials(policy, env);
+      const secrets = await createWorkspaceSecrets(meta.providerResourceID, grantedCredentials);
+      const hostPort = await availableStablePort(meta.providerResourceID);
+      await transaction.update({ hostPort, imageDigest: image });
+      const manifests = buildManifests({ identity, refs, image, policy, token: secrets.token, modelAuth: secrets.modelAuth });
+      for (const manifest of manifests.infrastructure) {
+        const resource = `${manifest.kind.toLowerCase()}:${manifest.metadata.name}`;
+        await transaction.create(resource, () => createManifest(kubectl, manifest), () => deleteResource(kubectl, manifest.kind, manifest.metadata.name, refs.namespace), () => resourceExistsOwned(kubectl, manifest.kind, manifest.metadata.name, refs.namespace, manifest.metadata.labels));
+      }
+      if (policy.egress.mode === 'managed') await kubectl(['rollout', 'status', `deployment/${refs.gatewayDeployment}`, '-n', refs.namespace, '--timeout=120s'], { timeoutMs: 150_000 });
+      const seed = manifests.seedPod;
+      await transaction.create(`pod:${seed.metadata.name}`, () => createManifest(kubectl, seed), () => deleteResource(kubectl, 'pod', seed.metadata.name, refs.namespace), () => resourceExistsOwned(kubectl, 'pod', seed.metadata.name, refs.namespace, seed.metadata.labels));
+      await kubectl(['wait', '--for=condition=Ready', `pod/${seed.metadata.name}`, '-n', refs.namespace, '--timeout=120s'], { timeoutMs: 150_000 });
+      await transaction.create(
+        `seed:${refs.mutablePVC}`,
+        () => streamArchiveToSeedPod(sourceSnapshot.archivePath, refs, policy, WORKSPACE_RUNTIME.directory, sourceSnapshot.generation),
+        async () => undefined,
+        () => verifyKubernetesSeed(kubectl, seed.metadata.name, refs.namespace, WORKSPACE_RUNTIME.directory, sourceSnapshot.generation),
+      );
+      await transaction.create(
+        `seed:${refs.baselinePVC}`,
+        () => streamArchiveToSeedPod(sourceSnapshot.archivePath, refs, policy, WORKSPACE_RUNTIME.baselineDirectory, sourceSnapshot.generation),
+        async () => undefined,
+        () => verifyKubernetesSeed(kubectl, seed.metadata.name, refs.namespace, WORKSPACE_RUNTIME.baselineDirectory, sourceSnapshot.generation),
+      );
+      await deleteResource(kubectl, 'pod', seed.metadata.name, refs.namespace);
+      await transaction.create(`deployment:${refs.deployment}`, () => createManifest(kubectl, manifests.deployment), () => deleteResource(kubectl, 'deployment', refs.deployment, refs.namespace), () => resourceExistsOwned(kubectl, 'deployment', refs.deployment, refs.namespace, manifests.deployment.metadata.labels));
+      await kubectl(['rollout', 'status', `deployment/${refs.deployment}`, '-n', refs.namespace, '--timeout=120s'], { timeoutMs: 150_000 });
+      await verifyKubernetesWorkspace(kubectl, meta);
       await health(info);
-    } catch (error) {
-      await remove(info).catch(() => undefined);
-      throw error;
-    }
+      } finally {
+        await sourceSnapshot.dispose();
+      }
+    });
   }
 
   async function target(info) {
-    const meta = readExtra(info, provider);
-    await verifyKubernetesWorkspace(info, meta, policy);
-    const token = await getWorkspaceToken(meta.auth.tokenRef);
-    if (meta.runtime.connectivity === 'ingress' && policy.kubernetes.ingressBaseUrl) {
-      return {
-        type: 'remote',
-        url: `${policy.kubernetes.ingressBaseUrl.replace(/\/$/, '')}/${meta.runtime.service}`,
-        headers: { [meta.auth.header]: token },
-      };
+    const meta = readMetadata(info, provider, policy);
+    await verifyKubernetesWorkspace(kubectl, meta);
+    const state = await readOwnedState(meta);
+    if (policy.kubernetes.connectivity === 'ingress') {
+      const ingress = resolveIngressTarget(policy.kubernetes.ingress, meta.providerResourceID);
+      return { type: 'remote', url: ingress.url, headers: { 'x-openchamber-workspace-token': await getWorkspaceToken(meta.authRef) } };
     }
-    const port = await ensurePortForward(meta);
-    return {
-      type: 'remote',
-      url: `http://127.0.0.1:${port}`,
-      headers: { [meta.auth.header]: token },
-    };
+    if (!state?.hostPort) throw new Error('Kubernetes workspace stable target port is missing');
+    await ensurePortForward(meta, state.hostPort, policy);
+    return { type: 'remote', url: `http://127.0.0.1:${state.hostPort}`, headers: { 'x-openchamber-workspace-token': await getWorkspaceToken(meta.authRef) } };
   }
 
   async function health(info) {
@@ -96,390 +117,332 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
   }
 
   async function remove(info) {
-    const meta = readExtra(info, provider);
-    stopPortForward(portForwardKey(meta));
-    await verifyKubernetesResource(info, meta, policy, 'deployment', meta.runtime.deployment, meta.runtime.namespace).catch((error) => {
-      if (!isKubernetesNotFound(error)) throw error;
+    const meta = readMetadata(info, provider, policy);
+    const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
+    stopPortForward(meta.providerResourceID);
+    return cleanupTransaction(meta.providerResourceID, async (cleanup) => {
+      await verifyExistingResources(kubectl, meta);
+      for (const [kind, name] of expectedResources(refs).filter(([resourceKind]) => !['pvc'].includes(resourceKind))) {
+        await cleanup.remove(`${kind}:${name}`, () => deleteResource(kubectl, kind, name, refs.namespace));
+      }
+      if (!policy.retention.preserveOnDelete) {
+        await cleanup.remove(`pvc:${refs.mutablePVC}`, () => deleteResource(kubectl, 'pvc', refs.mutablePVC, refs.namespace));
+        await cleanup.remove(`pvc:${refs.baselinePVC}`, () => deleteResource(kubectl, 'pvc', refs.baselinePVC, refs.namespace));
+      } else {
+        cleanup.retain(`pvc:${refs.mutablePVC}`);
+        cleanup.retain(`pvc:${refs.baselinePVC}`);
+      }
     });
-    const failures = [];
-    await verifyKubernetesResource(info, meta, policy, 'service', meta.runtime.service, meta.runtime.namespace).catch((error) => {
-      if (!isKubernetesNotFound(error)) throw error;
-    });
-    await verifyKubernetesResource(info, meta, policy, 'secret', meta.runtime.secret, meta.runtime.namespace).catch((error) => {
-      if (!isKubernetesNotFound(error)) throw error;
-    });
-    if (meta.policy.kubernetes.networkPolicy === 'default-deny' && meta.runtime.networkPolicy) {
-      await verifyKubernetesResource(info, meta, policy, 'networkpolicy', meta.runtime.networkPolicy, meta.runtime.namespace).catch((error) => {
-        if (!isKubernetesNotFound(error)) throw error;
-      });
-    }
-    if (!policy.retention.preserveOnDelete) {
-      await verifyKubernetesResource(info, meta, policy, 'pvc', meta.storage.pvc, meta.storage.namespace).catch((error) => {
-        if (!isKubernetesNotFound(error)) throw error;
-      });
-    }
-    await kubectl(['delete', 'deployment', meta.runtime.deployment, '-n', meta.runtime.namespace, '--ignore-not-found=true'], { timeoutMs: 60_000 }).catch((error) => failures.push(error));
-    await kubectl(['delete', 'service', meta.runtime.service, '-n', meta.runtime.namespace, '--ignore-not-found=true'], { timeoutMs: 60_000 }).catch((error) => failures.push(error));
-    await kubectl(['delete', 'secret', meta.runtime.secret, '-n', meta.runtime.namespace, '--ignore-not-found=true'], { timeoutMs: 60_000 }).catch((error) => failures.push(error));
-    if (meta.policy.kubernetes.networkPolicy === 'default-deny' && meta.runtime.networkPolicy) {
-      await kubectl(['delete', 'networkpolicy', meta.runtime.networkPolicy, '-n', meta.runtime.namespace, '--ignore-not-found=true'], { timeoutMs: 60_000 }).catch((error) => failures.push(error));
-    }
-    if (!policy.retention.preserveOnDelete) {
-      await kubectl(['delete', 'pvc', meta.storage.pvc, '-n', meta.storage.namespace, '--ignore-not-found=true'], { timeoutMs: 60_000 }).catch((error) => failures.push(error));
-    }
-    if (failures.length > 0) throw new Error(`Kubernetes workspace cleanup failed: ${failures.map((error) => error.message).join('; ')}`);
-    await deleteWorkspaceToken(meta.auth.tokenRef).catch(() => undefined);
   }
 
   async function list(context) {
-    await kubectl(['version', '--client=true'], { timeoutMs: 15_000 }).catch((error) => {
-      throw new ProviderUnavailableError('kubectl is not available', { provider, cause: error });
-    });
-    const projectID = sanitizeLabelValue(context?.instance?.project?.id ?? '');
-    const selector = projectID
-      ? `openchamber.io/managed=true,openchamber.io/provider=kubernetes,openchamber.io/project-id=${projectID}`
-      : 'openchamber.io/managed=true,openchamber.io/provider=kubernetes';
+    const projectID = context?.instance?.project?.id;
+    if (!projectID) throw new Error('Kubernetes workspace discovery requires an authoritative project ID');
+    const selector = `openchamber.io/managed=true,openchamber.io/provider=kubernetes,openchamber.io/role=runtime,openchamber.io/project-id=${labelHash(projectID)}`;
     const { stdout } = await kubectl(['get', 'deployment', '-n', policy.kubernetes.namespace, '-l', selector, '-o', 'json'], { timeoutMs: 30_000 });
-    const parsed = JSON.parse(stdout);
-    return (parsed.items ?? []).map((item) => {
-      const labels = item.metadata?.labels ?? {};
-      const id = labels['openchamber.io/workspace-id'] ?? item.metadata?.name ?? 'unknown';
-      const project = labels['openchamber.io/project-id'] ?? context?.instance?.project?.id ?? 'unknown';
-      const deployment = item.metadata?.name ?? `openchamber-ws-${id}`.slice(0, 63);
-      return {
-        type: provider,
-        name: deployment,
-        branch: null,
-        directory: WORKSPACE_RUNTIME.directory,
-        extra: createExtra({ id, projectID: project }, provider, policy, {
-          storage: { type: 'kubernetes-pvc', namespace: policy.kubernetes.namespace, pvc: deployment },
-          runtime: {
-            type: 'kubernetes-deployment',
-            namespace: policy.kubernetes.namespace,
-            deployment,
-            service: deployment,
-            secret: kubernetesResourceName(`${deployment}-auth`, id),
-            networkPolicy: deployment,
-            connectivity: policy.kubernetes.connectivity,
-          },
-        }),
-        projectID: project,
-      };
+    const result = [];
+    for (const item of JSON.parse(stdout).items ?? []) {
+      const providerResourceID = item.metadata?.labels?.['openchamber.io/resource-id'];
+      if (!providerResourceID) continue;
+      const state = await readWorkspaceState(providerResourceID);
+      if (!state || state.projectID !== String(projectID) || state.provider !== provider) continue;
+      const identity = { provider, providerResourceID, projectID: String(projectID), controlPlaneWorkspaceID: state.controlPlaneWorkspaceID, originalControlPlaneWorkspaceID: state.originalControlPlaneWorkspaceID ?? state.controlPlaneWorkspaceID };
+      result.push({ type: provider, name: workspaceName(providerResourceID, provider), branch: null, directory: WORKSPACE_RUNTIME.directory, projectID: String(projectID), extra: createMetadata({ id: state.controlPlaneWorkspaceID, projectID: String(projectID) }, provider, policy, canonicalResourceRefs(providerResourceID, provider, policy), identity) });
+    }
+    return result;
+  }
+
+  async function exportWorkspace(info) {
+    const meta = readMetadata(info, provider, policy);
+    await verifyKubernetesWorkspace(kubectl, meta);
+    const state = await readOwnedState(meta);
+    const snapshot = await runJson('kubectl', [...contextArgs(policy), 'exec', `deployment/${meta.resourceRefs.deployment}`, '-n', meta.resourceRefs.namespace, '--', 'node', '-e', RUNTIME_ARTIFACT_SCRIPT, WORKSPACE_RUNTIME.baselineDirectory, WORKSPACE_RUNTIME.directory, state.baselineGeneration, String(ARTIFACT_LIMITS.maxTextBytes), String(ARTIFACT_LIMITS.maxBlobBytes), String(ARTIFACT_LIMITS.maxTotalBytes)], { timeoutMs: 120_000, maxOutputBytes: ARTIFACT_LIMITS.maxOutputBytes, sensitiveOutput: true, sensitiveValues: [RUNTIME_ARTIFACT_SCRIPT] });
+    return { ...snapshot, provider, providerResourceID: meta.providerResourceID };
+  }
+
+  async function reconcile(info) {
+    const meta = readMetadata(info, provider, policy);
+    try {
+      await verifyKubernetesWorkspace(kubectl, meta);
+      const state = await readOwnedState(meta);
+      const remote = await target(info);
+      await waitForHttpHealth(remote.url, remote.headers, { timeoutMs: 15_000 });
+      const repaired = policy.kubernetes.connectivity === 'port-forward' ? ['stable-port-forward'] : [];
+      if (state.lifecycle !== 'ready') { await writeWorkspaceState(meta.providerResourceID, { ...state, lifecycle: 'ready', reconciledAt: new Date().toISOString() }); repaired.push('operation-journal'); }
+      return { provider, providerResourceID: meta.providerResourceID, status: 'ready', diagnostics: [], repaired };
+    } catch (error) {
+      return { provider, providerResourceID: meta.providerResourceID, status: 'degraded', diagnostics: [{ code: error?.code ?? 'WORKSPACE_RECONCILE_FAILED', message: error instanceof Error ? error.message : String(error) }], repaired: [] };
+    }
+  }
+
+  async function rotateCredentials(info, request = {}) {
+    const meta = readMetadata(info, provider, policy);
+    await verifyKubernetesWorkspace(kubectl, meta);
+    await readOwnedState(meta);
+    if (request.modelAuth != null && policy.credentials.modelAuth !== 'explicit-opencode-auth-content') throw new Error('Model authentication grants are disabled by workspace policy');
+    return rotateWorkspaceCredentials(meta.providerResourceID, request, async ({ token, modelAuth }) => {
+      await verifyKubernetesWorkspace(kubectl, meta);
+      const stringData = { 'endpoint-token': token };
+      if (modelAuth !== undefined) stringData['model-auth.json'] = modelAuth;
+      const resourceVersion = (await kubectl(['get', 'secret', meta.resourceRefs.secret, '-n', meta.resourceRefs.namespace, '-o', 'jsonpath={.metadata.resourceVersion}'], { timeoutMs: 30_000 })).stdout;
+      await kubectl(['replace', '-f', '-'], { input: JSON.stringify({ apiVersion: 'v1', kind: 'Secret', metadata: { name: meta.resourceRefs.secret, namespace: meta.resourceRefs.namespace, resourceVersion, labels: providerLabels(identityFromMetadata(meta), 'secrets') }, type: 'Opaque', stringData }), timeoutMs: 60_000, sensitiveOutput: true });
+      stopPortForward(meta.providerResourceID);
+      for (const { args, timeoutMs } of kubernetesCredentialRefreshCommands(meta)) await kubectl(args, { timeoutMs });
     });
   }
 
-  async function exportDiff(info) {
-    const meta = readExtra(info, provider);
-    await verifyKubernetesWorkspace(info, meta, policy);
-    const { stdout } = await kubectl(['exec', `deployment/${meta.runtime.deployment}`, '-n', meta.runtime.namespace, '--', 'sh', '-lc', EXPORT_DIFF_COMMAND], { timeoutMs: 60_000 });
-    return { patch: stdout, provider };
-  }
-
-  return { kind: provider, configure, create, target, remove, list, health, exportDiff };
-
-  async function applyManifest(manifest) {
-    await run('kubectl', [
-      ...(policy.kubernetes.context ? ['--context', policy.kubernetes.context] : []),
-      'apply', '-f', '-',
-    ], { timeoutMs: 60_000, env: { KUBECTL_EXTERNAL_DIFF: 'true' }, input: manifest });
-  }
+  return { kind: provider, configure, create, target, remove, list, health, exportWorkspace, reconcile, rotateCredentials, validate: preflight };
 }
 
-function buildManifest(meta, image, token, env) {
-  const labels = meta.labels;
-  const namespace = meta.runtime.namespace;
-  const proxyEnv = runtimeEnvironment(meta, KUBERNETES_TOKEN_FILE);
-  const envBlock = [
-    { name: 'OPENCODE_AUTH_CONTENT', value: env.OPENCODE_AUTH_CONTENT ?? '' },
-    { name: 'OPENCODE_WORKSPACE_ID', value: env.OPENCODE_WORKSPACE_ID ?? labels['openchamber.io/workspace-id'] },
-    { name: 'OPENCODE_EXPERIMENTAL_WORKSPACES', value: 'true' },
-    ...Object.entries(proxyEnv).map(([name, value]) => ({ name, value })),
+export function buildManifests({ identity, refs, image, policy, token, modelAuth }) {
+  const namespace = refs.namespace;
+  const secretData = { 'endpoint-token': token };
+  if (modelAuth) secretData['model-auth.json'] = modelAuth;
+  const runtimePolicy = policy.egress.mode === 'managed'
+    ? { ...policy, egress: { ...policy.egress, proxyUrl: `http://${refs.gatewayService}:3128` } }
+    : { ...policy, egress: { ...policy.egress, proxyUrl: policy.egress.proxyUrl } };
+  const infrastructure = [
+    resource('v1', 'Secret', refs.secret, namespace, providerLabels(identity, 'secrets'), { type: 'Opaque', stringData: secretData }),
+    resource('v1', 'ServiceAccount', refs.serviceAccount, namespace, providerLabels(identity, 'service-account'), { automountServiceAccountToken: false }),
+    pvc(refs.mutablePVC, 'mutable-storage'),
+    pvc(refs.baselinePVC, 'baseline-storage'),
+    resource('v1', 'Service', refs.service, namespace, providerLabels(identity, 'service'), { spec: { selector: selector(identity), ports: [{ port: WORKSPACE_RUNTIME.port, targetPort: WORKSPACE_RUNTIME.port }] } }),
+    resource('networking.k8s.io/v1', 'NetworkPolicy', refs.networkPolicy, namespace, providerLabels(identity, 'network-policy'), { spec: { podSelector: { matchLabels: selector(identity) }, policyTypes: ['Ingress', 'Egress'], ingress: buildRuntimeIngress(policy), egress: buildRuntimeEgress(policy, identity, refs) } }),
+    resource('networking.k8s.io/v1', 'NetworkPolicy', refs.seedNetworkPolicy, namespace, providerLabels(identity, 'seed-network-policy'), { spec: { podSelector: { matchLabels: roleSelector(identity, 'seed') }, policyTypes: ['Ingress', 'Egress'], ingress: [], egress: [] } }),
   ];
-  const items = [
-    {
-      apiVersion: 'v1', kind: 'Secret', metadata: { name: meta.runtime.secret, namespace, labels }, type: 'Opaque',
-      stringData: { token },
-    },
-    {
-      apiVersion: 'v1', kind: 'PersistentVolumeClaim', metadata: { name: meta.storage.pvc, namespace, labels },
-      spec: { accessModes: ['ReadWriteOnce'], resources: { requests: { storage: meta.policy.kubernetes.storage } } },
-    },
-    {
-      apiVersion: 'apps/v1', kind: 'Deployment', metadata: { name: meta.runtime.deployment, namespace, labels },
-      spec: {
-        replicas: 1,
-        selector: { matchLabels: { 'openchamber.io/workspace-id': labels['openchamber.io/workspace-id'] } },
-        template: {
-          metadata: { labels },
-          spec: {
-            securityContext: { seccompProfile: { type: 'RuntimeDefault' } },
-            containers: [{
-              name: 'opencode', image, workingDir: WORKSPACE_RUNTIME.directory,
-              command: ['sh', '-lc', runtimeCommand(KUBERNETES_TOKEN_FILE)],
-              ports: [{ containerPort: WORKSPACE_RUNTIME.port }], env: envBlock,
-              resources: {
-                requests: { cpu: meta.policy.kubernetes.cpuRequest, memory: meta.policy.kubernetes.memoryRequest },
-                limits: { cpu: meta.policy.kubernetes.cpuLimit, memory: meta.policy.kubernetes.memoryLimit },
-              },
-              securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ['ALL'] } },
-              volumeMounts: [
-                { name: 'workspace', mountPath: WORKSPACE_RUNTIME.directory },
-                { name: 'workspace-auth', mountPath: KUBERNETES_TOKEN_MOUNT_PATH, readOnly: true },
-              ],
-            }],
-            volumes: [
-              { name: 'workspace', persistentVolumeClaim: { claimName: meta.storage.pvc } },
-              { name: 'workspace-auth', secret: { secretName: meta.runtime.secret, defaultMode: 0o400 } },
-            ],
-          },
-        },
-      },
-    },
-    {
-      apiVersion: 'v1', kind: 'Service', metadata: { name: meta.runtime.service, namespace, labels },
-      spec: { selector: { 'openchamber.io/workspace-id': labels['openchamber.io/workspace-id'] }, ports: [{ port: WORKSPACE_RUNTIME.port, targetPort: WORKSPACE_RUNTIME.port }] },
-    },
-  ];
-  if (meta.policy.kubernetes.networkPolicy === 'default-deny') {
-    items.push({
-      apiVersion: 'networking.k8s.io/v1', kind: 'NetworkPolicy', metadata: { name: meta.runtime.networkPolicy, namespace, labels },
-      spec: {
-        podSelector: { matchLabels: { 'openchamber.io/workspace-id': labels['openchamber.io/workspace-id'] } },
-        policyTypes: ['Ingress', 'Egress'],
-        ingress: [],
-        egress: buildDefaultDenyEgress(meta.policy.egress),
-      },
-    });
+  if (policy.egress.mode === 'managed') {
+    infrastructure.push(
+      resource('v1', 'Service', refs.gatewayService, namespace, providerLabels(identity, 'egress-service'), { spec: { selector: roleSelector(identity, 'egress-gateway'), ports: [{ port: 3128, targetPort: 3128 }] } }),
+      resource('apps/v1', 'Deployment', refs.gatewayDeployment, namespace, providerLabels(identity, 'egress-gateway'), { spec: { replicas: 1, selector: { matchLabels: roleSelector(identity, 'egress-gateway') }, template: { metadata: { labels: { ...providerLabels(identity, 'egress-gateway'), ...roleSelector(identity, 'egress-gateway') } }, spec: { serviceAccountName: refs.serviceAccount, automountServiceAccountToken: false, securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, seccompProfile: { type: 'RuntimeDefault' } }, containers: [{ name: 'gateway', image: policy.egress.gatewayImage, env: [{ name: 'OPENCHAMBER_RESOURCE_ID', value: identity.providerResourceID }, { name: 'OPENCHAMBER_EGRESS_POLICY', value: JSON.stringify(policy.egress.gatewayPolicy) }], ports: [{ containerPort: 3128 }], securityContext: hardenedSecurity(), resources: { requests: { cpu: '50m', memory: '64Mi' }, limits: { cpu: '500m', memory: '256Mi' } }, readinessProbe: { tcpSocket: { port: 3128 }, periodSeconds: 5 }, livenessProbe: { tcpSocket: { port: 3128 }, periodSeconds: 10 } }] } } } }),
+      resource('networking.k8s.io/v1', 'NetworkPolicy', refs.gatewayNetworkPolicy, namespace, providerLabels(identity, 'egress-network-policy'), { spec: { podSelector: { matchLabels: roleSelector(identity, 'egress-gateway') }, policyTypes: ['Ingress', 'Egress'], ingress: [{ from: [{ podSelector: { matchLabels: selector(identity) } }], ports: [{ protocol: 'TCP', port: 3128 }] }], egress: buildGatewayEgress(policy.egress) } }),
+    );
   }
-  return JSON.stringify({
-    apiVersion: 'v1',
-    kind: 'List',
-    items,
+  if (policy.kubernetes.connectivity === 'ingress') infrastructure.push(buildIngress(identity, refs, policy.kubernetes.ingress));
+  const seedPod = resource('v1', 'Pod', `${refs.deployment}-seed`, namespace, providerLabels(identity, 'seed'), {
+    spec: {
+      restartPolicy: 'Never', automountServiceAccountToken: false, serviceAccountName: refs.serviceAccount,
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, fsGroupChangePolicy: 'OnRootMismatch', seccompProfile: { type: 'RuntimeDefault' } },
+      containers: [{ name: 'seed', image, command: ['sh', '-lc', 'sleep 3600'], securityContext: hardenedSecurity(), resources: resources(policy), volumeMounts: [{ name: 'workspace', mountPath: WORKSPACE_RUNTIME.directory }, { name: 'baseline', mountPath: WORKSPACE_RUNTIME.baselineDirectory }, { name: 'tmp', mountPath: '/tmp' }] }],
+      volumes: [{ name: 'workspace', persistentVolumeClaim: { claimName: refs.mutablePVC } }, { name: 'baseline', persistentVolumeClaim: { claimName: refs.baselinePVC } }, { name: 'tmp', emptyDir: { sizeLimit: '2Gi' } }],
+    },
   });
+  const probe = { exec: { command: ['node', '-e', `const fs=require('fs'),http=require('http');const t=fs.readFileSync('${KUBERNETES_TOKEN_FILE}','utf8');const r=http.get({host:'127.0.0.1',port:${WORKSPACE_RUNTIME.port},path:'/global/health',headers:{'x-openchamber-workspace-token':t}},x=>process.exit(x.statusCode===200?0:1));r.on('error',()=>process.exit(1));setTimeout(()=>process.exit(1),3000)`] }, timeoutSeconds: 5, periodSeconds: 10 };
+  const runtimeEnv = [{ name: 'OPENCODE_EXPERIMENTAL_WORKSPACES', value: 'true' }, ...Object.entries(runtimeEnvironment({ policy: runtimePolicy }, KUBERNETES_TOKEN_FILE)).map(([name, value]) => ({ name, value }))];
+  const deployment = resource('apps/v1', 'Deployment', refs.deployment, namespace, providerLabels(identity, 'runtime'), {
+    spec: {
+      replicas: 1, selector: { matchLabels: selector(identity) },
+      template: { metadata: { labels: { ...providerLabels(identity, 'runtime'), ...selector(identity) } }, spec: {
+        serviceAccountName: refs.serviceAccount, automountServiceAccountToken: false,
+        securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, fsGroupChangePolicy: 'OnRootMismatch', seccompProfile: { type: 'RuntimeDefault' } },
+        containers: [{ name: 'opencode', image, workingDir: WORKSPACE_RUNTIME.directory, command: ['sh', '-lc', runtimeCommand(KUBERNETES_TOKEN_FILE, `${KUBERNETES_TOKEN_MOUNT_PATH}/model-auth.json`)], ports: [{ containerPort: WORKSPACE_RUNTIME.port }], env: runtimeEnv, resources: resources(policy), securityContext: hardenedSecurity(), startupProbe: { ...probe, failureThreshold: 30 }, readinessProbe: probe, livenessProbe: { ...probe, failureThreshold: 3 }, volumeMounts: [{ name: 'workspace', mountPath: WORKSPACE_RUNTIME.directory }, { name: 'baseline', mountPath: WORKSPACE_RUNTIME.baselineDirectory, readOnly: true }, { name: 'secrets', mountPath: KUBERNETES_TOKEN_MOUNT_PATH, readOnly: true }, { name: 'tmp', mountPath: '/tmp' }] }],
+        volumes: [{ name: 'workspace', persistentVolumeClaim: { claimName: refs.mutablePVC } }, { name: 'baseline', persistentVolumeClaim: { claimName: refs.baselinePVC } }, { name: 'secrets', secret: { secretName: refs.secret, defaultMode: 0o440 } }, { name: 'tmp', emptyDir: { sizeLimit: '256Mi' } }],
+      } },
+    },
+  });
+  return { infrastructure, seedPod, deployment };
+
+  function pvc(name, role) {
+    return resource('v1', 'PersistentVolumeClaim', name, namespace, providerLabels(identity, role), { spec: { accessModes: ['ReadWriteOnce'], resources: { requests: { storage: policy.kubernetes.storage } } } });
+  }
 }
 
-function buildDefaultDenyEgress(egress) {
-  const proxyPort = parseProxyPort(egress.httpProxy);
+function resource(apiVersion, kind, name, namespace, labels, body) {
+  return { apiVersion, kind, metadata: { name, namespace, labels }, ...body };
+}
+
+function selector(identity) {
+  return roleSelector(identity, 'runtime');
+}
+
+function roleSelector(identity, role) {
+  return { 'openchamber.io/resource-id': identity.providerResourceID, 'openchamber.io/role': role };
+}
+
+function hardenedSecurity() {
+  return { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ['ALL'] } };
+}
+
+function resources(policy) {
+  return { requests: { cpu: policy.kubernetes.cpuRequest, memory: policy.kubernetes.memoryRequest }, limits: { cpu: policy.kubernetes.cpuLimit, memory: policy.kubernetes.memoryLimit } };
+}
+
+function buildRuntimeEgress(policy, identity) {
+  const dns = dnsEgress(policy.egress.dnsCIDRs);
+  if (policy.egress.mode === 'managed') return [...dns, { to: [{ podSelector: { matchLabels: roleSelector(identity, 'egress-gateway') } }], ports: [{ protocol: 'TCP', port: 3128 }] }];
+  const proxy = new URL(policy.egress.proxyUrl);
+  const port = Number(proxy.port || (proxy.protocol === 'http:' ? 80 : 443));
+  return [...dns, { to: [{ ipBlock: { cidr: policy.egress.proxyCIDR } }], ports: [{ protocol: 'TCP', port }] }];
+}
+
+function buildGatewayEgress(egress) {
+  const privateCIDRs = ['0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.168.0.0/16', '224.0.0.0/4', '240.0.0.0/4'];
+  const publicInternet = { to: [{ ipBlock: { cidr: '0.0.0.0/0', except: privateCIDRs } }, { ipBlock: { cidr: '::/0', except: ['::/128', '::1/128', 'fc00::/7', 'fe80::/10', 'ff00::/8'] } }] };
+  const explicit = egress.gatewayPolicy.allowedCIDRs.map((cidr) => ({ to: [{ ipBlock: { cidr } }] }));
+  return [...dnsEgress(egress.dnsCIDRs), publicInternet, ...explicit];
+}
+
+function dnsEgress(cidrs) {
+  const ports = [{ protocol: 'UDP', port: 53 }, { protocol: 'TCP', port: 53 }];
   return [
-    ...egress.dnsCIDRs.map((cidr) => ({
-      to: [{ ipBlock: { cidr } }],
-      ports: [
-        { protocol: 'UDP', port: 53 },
-        { protocol: 'TCP', port: 53 },
-      ],
-    })),
-    {
-      to: [{ ipBlock: { cidr: egress.proxyCIDR } }],
-      ports: [{ protocol: 'TCP', port: proxyPort }],
-    },
+    ...cidrs.map((cidr) => ({ to: [{ ipBlock: { cidr } }], ports })),
+    { to: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' } }, podSelector: { matchLabels: { 'k8s-app': 'kube-dns' } } }], ports },
   ];
 }
 
-function parseProxyPort(value) {
-  const parsed = new URL(value);
-  if (parsed.port) return Number(parsed.port);
-  return parsed.protocol === 'http:' ? 80 : 443;
+function buildRuntimeIngress(policy) {
+  if (policy.kubernetes.connectivity !== 'ingress') return [];
+  return [{ from: [{ namespaceSelector: { matchLabels: policy.kubernetes.ingress.controllerNamespaceSelector }, podSelector: { matchLabels: policy.kubernetes.ingress.controllerPodSelector } }], ports: [{ protocol: 'TCP', port: WORKSPACE_RUNTIME.port }] }];
 }
 
-async function seedWorkspace(meta, sourceDirectory, policy) {
-  // Stream tar explicitly instead of `kubectl cp`: kubectl preserves local
-  // UID/GID and fails against hardened containers that cannot chown files.
-  const pod = await findWorkspacePod(meta, policy);
-  await streamTarToPod({
-    sourceDirectory,
-    args: [
-    ...(policy.kubernetes.context ? ['--context', policy.kubernetes.context] : []),
-      'exec', '-i', '-n', meta.runtime.namespace, pod, '--',
-      'tar', '--no-same-owner', '-xf', '-', '-C', WORKSPACE_RUNTIME.directory,
-    ],
-    timeoutMs: 300_000,
-  });
+function buildIngress(identity, refs, ingressPolicy) {
+  const target = resolveIngressTarget(ingressPolicy, identity.providerResourceID);
+  const annotations = { ...ingressPolicy.annotations };
+  if (ingressPolicy.tls.mode === 'cert-manager') annotations['cert-manager.io/cluster-issuer'] = ingressPolicy.tls.clusterIssuer;
+  return resource('networking.k8s.io/v1', 'Ingress', refs.ingress, refs.namespace, providerLabels(identity, 'ingress'), { metadata: { name: refs.ingress, namespace: refs.namespace, labels: providerLabels(identity, 'ingress'), annotations }, spec: { ingressClassName: ingressPolicy.ingressClassName, tls: [{ hosts: [target.host], secretName: ingressPolicy.tls.mode === 'existing-secret' ? ingressPolicy.tls.secretName : `${refs.ingress}-tls` }], rules: [{ host: target.host, http: { paths: [{ path: target.path, pathType: 'Prefix', backend: { service: { name: refs.service, port: { number: WORKSPACE_RUNTIME.port } } } }] } }] } });
 }
 
-function streamTarToPod({ sourceDirectory, args, timeoutMs }) {
-  return new Promise((resolve, reject) => {
-    const tar = spawn('tar', ['cf', '-', '.'], { cwd: sourceDirectory, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    const kubectl = spawn('kubectl', args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
-    let stderr = '';
-    let stdout = '';
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      tar.kill('SIGKILL');
-      kubectl.kill('SIGKILL');
-      reject(new Error(`kubectl ${args.join(' ')} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-    const finish = (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (error) reject(error);
-      else resolve({ stdout, stderr });
-    };
-    tar.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
-    kubectl.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
-    kubectl.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
-    tar.on('error', finish);
-    kubectl.on('error', finish);
-    tar.on('close', (code, signal) => {
-      if (code !== 0) finish(new Error(`tar cf - . failed with ${signal ?? code}: ${stderr}`.trim()));
-    });
-    kubectl.on('close', (code, signal) => {
-      if (code === 0) finish();
-      else finish(new Error(`kubectl ${args.join(' ')} failed with ${signal ?? code}: ${stderr || stdout}`.trim()));
-    });
-    tar.stdout.pipe(kubectl.stdin);
-  });
+export function resolveIngressTarget(policy, providerResourceID) {
+  const host = policy.hostTemplate.replaceAll('{resourceID}', providerResourceID);
+  const path = policy.pathTemplate.replaceAll('{resourceID}', providerResourceID);
+  return { host, path, url: `https://${host}${path}` };
 }
 
-async function initializeWorkspaceBaseline(meta, policy) {
-  const pod = await findWorkspacePod(meta, policy);
-  await run('kubectl', [
-    ...(policy.kubernetes.context ? ['--context', policy.kubernetes.context] : []),
-    'exec', '-n', meta.runtime.namespace, pod, '--', 'sh', '-lc', BASELINE_COMMAND,
-  ], { timeoutMs: 120_000 });
+export function kubernetesCredentialRefreshCommands(meta) {
+  const runtimeSelector = selectorString(selector(identityFromMetadata(meta)));
+  return [
+    { args: ['delete', 'pod', '-l', runtimeSelector, '-n', meta.resourceRefs.namespace, '--wait=true'], timeoutMs: 90_000 },
+    { args: ['rollout', 'status', `deployment/${meta.resourceRefs.deployment}`, '-n', meta.resourceRefs.namespace, '--timeout=120s'], timeoutMs: 150_000 },
+  ];
 }
 
-async function findWorkspacePod(meta, policy) {
-  const selector = `openchamber.io/workspace-id=${meta.labels['openchamber.io/workspace-id']}`;
-  const { stdout } = await run('kubectl', [
-    ...(policy.kubernetes.context ? ['--context', policy.kubernetes.context] : []),
-    'get', 'pods', '-n', meta.runtime.namespace, '-l', selector, '-o', 'json',
-  ], { timeoutMs: 30_000 });
-  const pods = JSON.parse(stdout).items ?? [];
-  const ready = pods.find((pod) => pod.status?.phase === 'Running' && (pod.status?.containerStatuses ?? []).every((status) => status.ready));
-  const name = ready?.metadata?.name ?? pods[0]?.metadata?.name;
-  if (!name) throw new Error(`No Kubernetes workspace pod found for ${meta.runtime.deployment}`);
-  return name;
+async function createManifest(kubectl, manifest) {
+  await kubectl(['create', '-f', '-'], { timeoutMs: 60_000, input: JSON.stringify(manifest) });
 }
 
-async function ensurePortForward(meta) {
-  const key = portForwardKey(meta);
-  const existing = portForwardState.get(key);
-  if (existing && existing.child.exitCode === null && existing.child.signalCode === null) {
-    return existing.port;
+async function deleteResource(kubectl, kind, name, namespace) {
+  await kubectl(['delete', kind.toLowerCase(), name, '-n', namespace, '--ignore-not-found=true', '--wait=true'], { timeoutMs: 90_000 });
+}
+
+async function assertResourcesAbsent(kubectl, refs) {
+  for (const [kind, name] of expectedResources(refs)) {
+    const exists = await kubectl(['get', kind, name, '-n', refs.namespace, '-o', 'name'], { timeoutMs: 20_000 }).then(() => true).catch((error) => { if (isNotFound(error)) return false; throw error; });
+    if (exists) throw new OwnershipError(`Kubernetes resource collision: ${kind}/${name}`);
   }
-  stopPortForward(key);
-  const port = await getFreeLocalPort();
-  const args = [
-    ...(meta.policy.kubernetes.context ? ['--context', meta.policy.kubernetes.context] : []),
-    'port-forward', `service/${meta.runtime.service}`, `${port}:${WORKSPACE_RUNTIME.port}`, '-n', meta.runtime.namespace,
-  ];
-  const child = spawnBackground('kubectl', args);
-  portForwardState.set(key, { child, port });
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-  if (child.exitCode !== null || child.signalCode !== null) {
-    portForwardState.delete(key);
-    throw new Error(`Kubernetes port-forward failed for ${meta.runtime.service}`);
-  }
-  return port;
 }
 
-const portForwardState = new Map();
-
-function portForwardKey(meta) {
-  return `${meta.policy.kubernetes.context ?? ''}:${meta.runtime.namespace}:${meta.runtime.service}`;
+async function verifyKubernetesWorkspace(kubectl, meta) {
+  const identity = identityFromMetadata(meta);
+  for (const [kind, name, role] of expectedResources(meta.resourceRefs)) await verifyResource(kubectl, kind, name, meta.resourceRefs.namespace, providerLabels(identity, role));
 }
 
-function stopPortForward(key) {
-  const existing = portForwardState.get(key);
-  if (!existing) return;
-  existing.child.kill('SIGTERM');
-  portForwardState.delete(key);
+async function verifyExistingResources(kubectl, meta) {
+  const identity = identityFromMetadata(meta);
+  for (const [kind, name, role] of expectedResources(meta.resourceRefs)) await verifyResource(kubectl, kind, name, meta.resourceRefs.namespace, providerLabels(identity, role)).catch((error) => { if (!isNotFound(error)) throw error; });
 }
 
-function getFreeLocalPort() {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
-    server.on('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address();
-      const port = typeof address === 'object' && address ? address.port : null;
-      server.close(() => {
-        if (port) resolve(port);
-        else reject(new Error('Failed to allocate a localhost port'));
-      });
-    });
-  });
-}
-
-function kubernetesResourceName(prefix, value) {
-  const hash = createHash('sha256').update(String(value ?? '')).digest('hex').slice(0, 10);
-  const cleaned = String(value ?? '')
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .replace(/-{2,}/g, '-') || 'workspace';
-  const base = `${prefix}-${cleaned}`.replace(/^-+|-+$/g, '');
-  return `${base.slice(0, Math.max(1, 63 - hash.length - 1)).replace(/-+$/g, '')}-${hash}`;
-}
-
-function requiredKubernetesPermissions(policy) {
-  const permissions = [
-    ['get', 'pods'],
-    ['list', 'pods'],
-    ['watch', 'pods'],
-    ['create', 'pods/exec'],
-    ['create', 'pods/portforward'],
-    ['create', 'secrets'],
-    ['get', 'secrets'],
-    ['patch', 'secrets'],
-    ['delete', 'secrets'],
-    ['create', 'persistentvolumeclaims'],
-    ['get', 'persistentvolumeclaims'],
-    ['patch', 'persistentvolumeclaims'],
-    ['delete', 'persistentvolumeclaims'],
-    ['create', 'deployments.apps'],
-    ['get', 'deployments.apps'],
-    ['patch', 'deployments.apps'],
-    ['delete', 'deployments.apps'],
-    ['create', 'services'],
-    ['get', 'services'],
-    ['patch', 'services'],
-    ['delete', 'services'],
-    ['create', 'networkpolicies.networking.k8s.io'],
-    ['get', 'networkpolicies.networking.k8s.io'],
-    ['patch', 'networkpolicies.networking.k8s.io'],
-    ['delete', 'networkpolicies.networking.k8s.io'],
-  ];
-  return permissions;
-}
-
-async function assertCanI(kubectl, verb, resource, namespace) {
-  const { stdout } = await kubectl(['auth', 'can-i', verb, resource, '-n', namespace], { timeoutMs: 20_000 });
-  if (stdout.trim() !== 'yes') throw new Error(`Kubernetes RBAC denies ${verb} ${resource} in namespace ${namespace}`);
-}
-
-async function verifyKubernetesWorkspace(info, meta, policy) {
-  return verifyKubernetesResource(info, meta, policy, 'deployment', meta.runtime.deployment, meta.runtime.namespace);
-}
-
-async function verifyKubernetesResource(info, meta, policy, kind, name, namespace) {
-  requireKubernetesManagedLabels(info, meta);
-  const { stdout } = await run('kubectl', [
-    ...(policy.kubernetes.context ? ['--context', policy.kubernetes.context] : []),
-    'get', kind, name, '-n', namespace, '-o', 'json',
-  ], { timeoutMs: 30_000 });
+async function verifyResource(kubectl, kind, name, namespace, expected) {
+  const { stdout } = await kubectl(['get', kind, name, '-n', namespace, '-o', 'json'], { timeoutMs: 30_000 });
   const labels = JSON.parse(stdout).metadata?.labels ?? {};
-  for (const [key, value] of Object.entries(meta.labels ?? {})) {
-    if (labels[key] !== String(value)) throw new Error(`Kubernetes workspace deployment label mismatch for ${key}`);
+  for (const [key, value] of Object.entries(expected)) if (labels[key] !== value) throw new OwnershipError(`Kubernetes ${kind} ownership mismatch for ${name}: ${key}`);
+}
+
+async function resourceExistsOwned(kubectl, kind, name, namespace, expected) {
+  try {
+    await verifyResource(kubectl, kind.toLowerCase(), name, namespace, expected);
+    return true;
+  } catch (error) {
+    if (isNotFound(error)) return false;
+    throw error;
   }
 }
 
-function requireKubernetesManagedLabels(info, meta) {
-  const labels = meta.labels ?? {};
-  const required = {
-    'openchamber.io/managed': 'true',
-    'openchamber.io/provider': 'kubernetes',
-    'openchamber.io/workspace-id': canonicalWorkspaceLabelID(info.id),
-  };
-  for (const [key, value] of Object.entries(required)) {
-    if (!value || labels[key] !== value) throw new Error(`Kubernetes workspace metadata is missing required managed label: ${key}`);
+function expectedResources(refs) {
+  const resources = [['deployment', refs.deployment, 'runtime'], ['service', refs.service, 'service'], ['secret', refs.secret, 'secrets'], ['serviceaccount', refs.serviceAccount, 'service-account'], ['pvc', refs.mutablePVC, 'mutable-storage'], ['pvc', refs.baselinePVC, 'baseline-storage'], ['networkpolicy', refs.networkPolicy, 'network-policy'], ['networkpolicy', refs.seedNetworkPolicy, 'seed-network-policy']];
+  if (refs.gatewayDeployment) resources.push(['deployment', refs.gatewayDeployment, 'egress-gateway'], ['service', refs.gatewayService, 'egress-service'], ['networkpolicy', refs.gatewayNetworkPolicy, 'egress-network-policy']);
+  if (refs.ingress) resources.push(['ingress', refs.ingress, 'ingress']);
+  return resources;
+}
+
+function streamArchiveToSeedPod(archivePath, refs, policy, targetDirectory, generation) {
+  const args = [...contextArgs(policy), 'exec', '-i', '-n', refs.namespace, `${refs.deployment}-seed`, '--', 'sh', '-lc', KUBERNETES_SEED_EXTRACT_COMMAND, '--', targetDirectory, generation];
+  return new Promise((resolve, reject) => {
+    const kube = spawn('kubectl', args, { stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true });
+    let stderr = '';
+    let settled = false;
+    const finish = (error) => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve(); };
+    const archive = createReadStream(archivePath);
+    const timer = setTimeout(() => { archive.destroy(); kube.kill('SIGKILL'); finish(new Error('Kubernetes workspace source seeding timed out')); }, 300_000);
+    kube.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-8192); });
+    archive.on('error', finish); kube.on('error', finish);
+    kube.on('close', (code) => code === 0 ? finish() : finish(new Error(`Kubernetes source seeding failed: ${stderr}`)));
+    archive.pipe(kube.stdin);
+  });
+}
+
+async function verifyKubernetesSeed(kubectl, seedPod, namespace, targetDirectory, generation) {
+  try {
+    const { stdout } = await kubectl(['exec', '-n', namespace, seedPod, '--', 'cat', `${targetDirectory}/.openchamber-runtime/source-generation`], { timeoutMs: 30_000 });
+    return stdout === generation;
+  } catch {
+    return false;
   }
 }
 
-function isKubernetesNotFound(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /not found/i.test(message);
+async function ensurePortForward(meta, port, policy) {
+  const existing = portForwards.get(meta.providerResourceID);
+  if (existing?.exitCode === null && existing?.signalCode === null) return;
+  stopPortForward(meta.providerResourceID);
+  if (!(await portAvailable(port))) throw new Error(`Persisted Kubernetes target port is unavailable: ${port}`);
+  const args = [...contextArgs(policy), 'port-forward', `service/${meta.resourceRefs.service}`, `${port}:${WORKSPACE_RUNTIME.port}`, '-n', meta.resourceRefs.namespace];
+  const child = spawnBackground('kubectl', args);
+  portForwards.set(meta.providerResourceID, child);
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  if (child.exitCode !== null || child.signalCode !== null) { portForwards.delete(meta.providerResourceID); throw new Error(`Kubernetes port-forward failed for ${meta.resourceRefs.service}`); }
+}
+
+function stopPortForward(id) {
+  const child = portForwards.get(id);
+  if (child) child.kill('SIGTERM');
+  portForwards.delete(id);
+}
+
+function contextArgs(policy) {
+  return policy.kubernetes.context ? ['--context', policy.kubernetes.context] : [];
+}
+
+function selectorString(selector) {
+  return Object.entries(selector).map(([key, value]) => `${key}=${value}`).join(',');
+}
+
+async function availableStablePort(providerResourceID) {
+  const start = 49152 + Number.parseInt(providerResourceID.slice(-4), 16) % 16384;
+  for (let offset = 0; offset < 512; offset += 1) { const port = 49152 + (start - 49152 + offset) % 16384; if (await portAvailable(port)) return port; }
+  throw new Error('Unable to allocate a stable loopback port');
+}
+
+function portAvailable(port) {
+  return new Promise((resolve) => { const server = createServer(); server.once('error', () => resolve(false)); server.listen(port, '127.0.0.1', () => server.close(() => resolve(true))); });
+}
+
+function requiredPermissions(policy) {
+  const resources = ['pods', 'secrets', 'serviceaccounts', 'persistentvolumeclaims', 'services', 'deployments.apps', 'networkpolicies.networking.k8s.io'];
+  const result = resources.flatMap((resource) => ['create', 'get', 'delete'].map((verb) => [verb, resource]));
+  result.push(['update', 'secrets']);
+  result.push(['list', 'deployments.apps'], ['watch', 'pods'], ['create', 'pods/exec'], ['create', 'pods/portforward']);
+  if (policy?.kubernetes?.connectivity === 'ingress') for (const verb of ['create', 'get', 'delete']) result.push([verb, 'ingresses.networking.k8s.io']);
+  return result;
+}
+
+function identityFromMetadata(meta) {
+  return { provider: meta.provider, providerResourceID: meta.providerResourceID, projectID: meta.projectID, controlPlaneWorkspaceID: meta.controlPlaneWorkspaceID, originalControlPlaneWorkspaceID: meta.originalControlPlaneWorkspaceID ?? meta.controlPlaneWorkspaceID };
+}
+
+async function readOwnedState(meta) {
+  const state = await readWorkspaceState(meta.providerResourceID);
+  if (!state || state.provider !== meta.provider || state.projectID !== meta.projectID || state.controlPlaneWorkspaceID !== meta.controlPlaneWorkspaceID) throw new OwnershipError('Kubernetes workspace state identity mismatch');
+  return state;
+}
+
+function isNotFound(error) {
+  return /not found/i.test(error instanceof Error ? error.message : String(error));
 }

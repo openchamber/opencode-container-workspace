@@ -19,5 +19,6 @@ describe('openchamber workspace plugin', () => {
     expect(register).toHaveBeenCalledWith('docker', expect.objectContaining({ name: 'Docker' }));
     expect(register).toHaveBeenCalledWith('kubernetes', expect.objectContaining({ name: 'Kubernetes' }));
     expect(register).toHaveBeenCalledWith('apple-container', expect.objectContaining({ name: 'Apple Container' }));
+    for (const [, adapter] of register.mock.calls) expect(adapter).not.toHaveProperty('exportDiff');
   });
 });

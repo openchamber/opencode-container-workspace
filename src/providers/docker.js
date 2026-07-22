@@ -1,13 +1,16 @@
-import { commandExists, run, runJson, sanitizeLabelValue } from '../process.js';
-import { canonicalWorkspaceLabelID } from '../label-id.js';
-import { ProviderUnavailableError } from '../errors.js';
-import { createExtra, readExtra, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
-import { createWorkspaceToken, deleteWorkspaceToken, getWorkspaceToken } from '../auth.js';
-import { SECURE_DOCKER_NETWORK, requireDockerEgress, validateImage } from '../policy.js';
+import { createServer } from 'node:net';
+import { dirname } from 'node:path';
+import { commandExists, run, runJson } from '../process.js';
+import { ProviderUnavailableError, OwnershipError } from '../errors.js';
+import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
+import { createWorkspaceSecrets, getWorkspaceToken, rotateWorkspaceCredentials, selectGrantedCredentials } from '../auth.js';
+import { requireDockerEgress, validateImage } from '../policy.js';
 import { waitForHttpHealth } from '../health.js';
-import { BASELINE_COMMAND, RUNTIME_TOKEN_FILE, runtimeCommand, runtimeEnvironment } from '../runtime-command.js';
-
-const EXPORT_DIFF_COMMAND = 'tmp=$(mktemp); idx=$(git rev-parse --git-path index 2>/dev/null || true); if [ -n "$idx" ] && [ -f "$idx" ]; then cp "$idx" "$tmp"; fi; GIT_INDEX_FILE="$tmp" git add -N . >/dev/null 2>&1 || true; GIT_INDEX_FILE="$tmp" git diff --binary HEAD; code=$?; rm -f "$tmp"; exit $code';
+import { PROVIDER_MODEL_AUTH_FILE, PROVIDER_SECRET_DIRECTORY, PROVIDER_TOKEN_FILE, runtimeCommand, runtimeEnvironment } from '../runtime-command.js';
+import { cleanupTransaction, createTransaction } from '../lifecycle.js';
+import { readWorkspaceState, stateRoot, writeWorkspaceState } from '../state-store.js';
+import { createSourceSnapshot } from '../snapshot.js';
+import { ARTIFACT_LIMITS, RUNTIME_ARTIFACT_SCRIPT } from '../artifact.js';
 
 export function createDockerProvider({ policy, sourceDirectory }) {
   const provider = 'docker';
@@ -16,97 +19,107 @@ export function createDockerProvider({ policy, sourceDirectory }) {
     requireDockerEgress(policy);
     if (!commandExists('docker')) throw new ProviderUnavailableError('Docker CLI is not available', { provider });
     await run('docker', ['info'], { timeoutMs: 15_000 });
+    return { provider, available: true, diagnostics: [] };
   }
 
   function configure(info) {
-    const name = workspaceName(info, provider);
-    const id = canonicalWorkspaceLabelID(info.id);
-    const image = validateImage(policy, info.extra?.image ?? policy.defaultImage);
-    const extra = createExtra(info, provider, { ...policy, defaultImage: image }, {
-      storage: { type: 'docker-volume', volume: `openchamber-ws-${id}` },
-      runtime: {
-        type: 'docker-container',
-        container: `openchamber-ws-${id}`,
-        accessContainer: `openchamber-ws-${id}-access`,
-      },
-    });
-    return { ...info, name, directory: WORKSPACE_RUNTIME.directory, extra };
+    const identity = deriveWorkspaceIdentity(info, provider);
+    const image = validateImage(policy, policy.defaultImage);
+    const refs = canonicalResourceRefs(identity.providerResourceID, provider, policy);
+    return {
+      ...info,
+      name: workspaceName(identity.providerResourceID, provider),
+      directory: WORKSPACE_RUNTIME.directory,
+      extra: createMetadata(info, provider, { ...policy, defaultImage: image }, refs, identity),
+    };
   }
 
-  async function create(info, env) {
+  async function create(info, env = {}) {
     await preflight();
-    const meta = readExtra(info, provider);
-    const image = validateImage(policy, meta.image);
-    const tokenInfo = await createWorkspaceToken(info.id);
-    const volume = meta.storage.volume;
-    const container = meta.runtime.container;
-    const accessContainer = meta.runtime.accessContainer;
-    const labels = Object.entries(meta.labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]);
-    const runtimeLabels = [...labels, '--label', 'openchamber.workspace.role=runtime'];
-    const accessLabels = [...labels, '--label', 'openchamber.workspace.role=access-proxy'];
-    try {
-      await run('docker', ['image', 'inspect', image], { timeoutMs: 20_000 }).catch(() => run('docker', ['pull', image], { timeoutMs: 300_000 }));
-      await ensureDockerNetwork(policy);
-      await run('docker', ['volume', 'create', ...labels, volume]);
-      await run('docker', [
-        'run', '-i', '--rm',
-        '--network', 'none',
-        '--security-opt', 'no-new-privileges',
-        '--cap-drop', 'ALL',
-        '-v', `${volume}:${WORKSPACE_RUNTIME.directory}`,
-        '-v', `${sourceDirectory}:/source:ro`,
-        image,
-        'sh', '-lc', `cd /source && tar cf - . | tar xf - -C ${WORKSPACE_RUNTIME.directory} && ${BASELINE_COMMAND} && umask 077 && mkdir -p ${WORKSPACE_RUNTIME.directory}/.openchamber && cat > ${RUNTIME_TOKEN_FILE}`,
-      ], { timeoutMs: 300_000, input: tokenInfo.token });
+    const meta = readMetadata(info, provider, policy);
+    const identity = identityFromMetadata(meta);
+    const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
+    const image = validateImage(policy, meta.imageDigest);
+    await run('docker', ['image', 'inspect', image], { timeoutMs: 20_000 }).catch(() => run('docker', ['pull', image], { timeoutMs: 300_000 }));
 
-      await run('docker', [
-        'run', '--rm',
-        '--network', 'none',
-        '--security-opt', 'no-new-privileges',
-        '--cap-drop', 'ALL',
-        '-v', `${volume}:${WORKSPACE_RUNTIME.directory}`,
-        image,
-        'sh', '-lc', `chmod 700 ${WORKSPACE_RUNTIME.directory}/.openchamber && chmod 600 ${RUNTIME_TOKEN_FILE}`,
-      ], { timeoutMs: 300_000 });
+    await createTransaction(identity, async (transaction) => {
+      const sourceSnapshot = await createSourceSnapshot(sourceDirectory, { temporaryRoot: stateRoot() });
+      try {
+      if (!transaction.recovering) await assertResourcesAbsent(refs);
+      await transaction.bindSnapshot(sourceSnapshot.generation);
+      const secrets = await createWorkspaceSecrets(meta.providerResourceID, selectGrantedCredentials(policy, env));
+      const hostPort = await availableStablePort(meta.providerResourceID);
+      await transaction.update({ hostPort, imageDigest: image });
+      await transaction.create(`network:${refs.network}`, async () => {
+        await run('docker', ['network', 'create', '--driver', 'bridge', '--internal', ...labelArgs(providerLabels(identity, 'network')), refs.network], { timeoutMs: 60_000 });
+      }, () => removeDocker('network', refs.network), () => dockerResourceExistsOwned('network', refs.network, providerLabels(identity, 'network')));
+      await transaction.create(`volume:${refs.mutableVolume}`, () => run('docker', ['volume', 'create', ...labelArgs(providerLabels(identity, 'mutable-storage')), refs.mutableVolume]), () => removeDocker('volume', refs.mutableVolume), () => dockerResourceExistsOwned('volume', refs.mutableVolume, providerLabels(identity, 'mutable-storage')));
+      await transaction.create(`volume:${refs.baselineVolume}`, () => run('docker', ['volume', 'create', ...labelArgs(providerLabels(identity, 'baseline-storage')), refs.baselineVolume]), () => removeDocker('volume', refs.baselineVolume), () => dockerResourceExistsOwned('volume', refs.baselineVolume, providerLabels(identity, 'baseline-storage')));
+      await transaction.create(`volume:${refs.secretVolume}`, () => run('docker', ['volume', 'create', ...labelArgs(providerLabels(identity, 'secrets')), refs.secretVolume]), () => removeDocker('volume', refs.secretVolume), () => dockerResourceExistsOwned('volume', refs.secretVolume, providerLabels(identity, 'secrets')));
 
-      const args = [
-        'run', '-d',
-        '--name', container,
-        ...runtimeLabels,
-        '--security-opt', 'no-new-privileges',
-        '--cap-drop', 'ALL',
-        '-v', `${volume}:${WORKSPACE_RUNTIME.directory}`,
+      await transaction.create(
+        `seed:${refs.mutableVolume}`,
+        () => seedVolume(image, refs.mutableVolume, WORKSPACE_RUNTIME.directory, sourceSnapshot.archivePath, sourceSnapshot.generation),
+        async () => undefined,
+        () => verifyDockerSeed(image, refs.mutableVolume, WORKSPACE_RUNTIME.directory, sourceSnapshot.generation),
+      );
+      await transaction.create(
+        `seed:${refs.baselineVolume}`,
+        () => seedVolume(image, refs.baselineVolume, WORKSPACE_RUNTIME.baselineDirectory, sourceSnapshot.archivePath, sourceSnapshot.generation),
+        async () => undefined,
+        () => verifyDockerSeed(image, refs.baselineVolume, WORKSPACE_RUNTIME.baselineDirectory, sourceSnapshot.generation),
+      );
+      await seedSecretVolume(image, refs.secretVolume, dirname(secrets.tokenPath));
+      await transaction.create(`container:${refs.gateway}`, () => startEgressGateway({ runtimeImage: image, refs, identity, egress: policy.egress }), () => removeDocker('container', refs.gateway), () => dockerResourceExistsOwned('container', refs.gateway, providerLabels(identity, 'egress-gateway')));
+      await transaction.create(
+        `network-attachment:${refs.gateway}:${refs.network}`,
+        () => run('docker', ['network', 'connect', '--alias', 'workspace-egress', refs.network, refs.gateway], { timeoutMs: 60_000 }),
+        () => disconnectDockerNetwork(refs.network, refs.gateway),
+        () => dockerContainerHasNetwork(refs.gateway, refs.network),
+      );
+      const runtimePolicy = { ...policy, egress: { ...policy.egress, proxyUrl: 'http://workspace-egress:3128' } };
+      const runtimeArgs = [
+        'run', '-d', '--name', refs.runtime,
+        ...labelArgs(providerLabels(identity, 'runtime')),
+        '--network', refs.network,
+        '--user', '1000:1000',
+        '--read-only', '--tmpfs', '/tmp:rw,exec,nosuid,size=256m',
+        '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL',
+        '--pids-limit', String(policy.docker.pidsLimit),
+        '-v', `${refs.mutableVolume}:${WORKSPACE_RUNTIME.directory}`,
+        '-v', `${refs.baselineVolume}:${WORKSPACE_RUNTIME.baselineDirectory}:ro`,
+        '-v', `${refs.secretVolume}:${PROVIDER_SECRET_DIRECTORY}:ro`,
         '-w', WORKSPACE_RUNTIME.directory,
-        '-e', `OPENCODE_AUTH_CONTENT=${env.OPENCODE_AUTH_CONTENT ?? ''}`,
-        '-e', `OPENCODE_WORKSPACE_ID=${env.OPENCODE_WORKSPACE_ID ?? info.id}`,
         '-e', 'OPENCODE_EXPERIMENTAL_WORKSPACES=true',
       ];
-      for (const [key, value] of Object.entries(runtimeEnvironment(meta, RUNTIME_TOKEN_FILE))) args.push('-e', `${key}=${value}`);
-      if (policy.docker.memoryLimit) args.push('--memory', policy.docker.memoryLimit);
-      if (policy.docker.cpuLimit) args.push('--cpus', policy.docker.cpuLimit);
-      if (policy.docker.networkMode && policy.docker.networkMode !== 'default') args.push('--network', policy.docker.networkMode);
-      args.push(image, 'sh', '-lc', runtimeCommand(RUNTIME_TOKEN_FILE));
-      await run('docker', args, { timeoutMs: 120_000 });
-      if (accessContainer) {
-        await startAccessProxy({ image, accessContainer, runtimeContainer: container, labels: accessLabels, policy });
-      }
+      for (const [key, value] of Object.entries(runtimeEnvironment({ policy: runtimePolicy }, PROVIDER_TOKEN_FILE))) runtimeArgs.push('-e', `${key}=${value}`);
+      if (policy.docker.memoryLimit) runtimeArgs.push('--memory', String(policy.docker.memoryLimit));
+      if (policy.docker.cpuLimit) runtimeArgs.push('--cpus', String(policy.docker.cpuLimit));
+      runtimeArgs.push(image, 'sh', '-lc', runtimeCommand(PROVIDER_TOKEN_FILE));
+      await transaction.create(`container:${refs.runtime}`, () => run('docker', runtimeArgs, { timeoutMs: 120_000 }), () => removeDocker('container', refs.runtime), () => dockerResourceExistsOwned('container', refs.runtime, providerLabels(identity, 'runtime')));
+      await transaction.create(`container:${refs.access}`, () => startAccessProxy({ image, refs, identity, hostPort }), () => removeDocker('container', refs.access), () => dockerResourceExistsOwned('container', refs.access, providerLabels(identity, 'access-proxy')));
+      await transaction.create(
+        `network-attachment:${refs.access}:${refs.network}`,
+        () => run('docker', ['network', 'connect', refs.network, refs.access], { timeoutMs: 60_000 }),
+        () => disconnectDockerNetwork(refs.network, refs.access),
+        () => dockerContainerHasNetwork(refs.access, refs.network),
+      );
+      await verifyDockerWorkspace(meta);
       await health(info);
-    } catch (error) {
-      await remove(info).catch(() => undefined);
-      throw error;
-    }
+      } finally {
+        await sourceSnapshot.dispose();
+      }
+    });
   }
 
   async function target(info) {
-    const meta = readExtra(info, provider);
-    await verifyDockerWorkspace(info, meta);
-    const token = await getWorkspaceToken(meta.auth.tokenRef);
-    const port = await inspectPort(meta.runtime.accessContainer ?? meta.runtime.container);
-    return {
-      type: 'remote',
-      url: `http://127.0.0.1:${port}`,
-      headers: { [meta.auth.header]: token },
-    };
+    const meta = readMetadata(info, provider, policy);
+    await verifyDockerWorkspace(meta);
+    const state = await readOwnedState(meta);
+    if (!state?.hostPort) throw new Error('Docker workspace stable target port is missing');
+    const port = await inspectPort(meta.resourceRefs.access);
+    if (port !== String(state.hostPort)) throw new OwnershipError('Docker workspace target port does not match persisted state');
+    return { type: 'remote', url: `http://127.0.0.1:${port}`, headers: { 'x-openchamber-workspace-token': await getWorkspaceToken(meta.authRef) } };
   }
 
   async function health(info) {
@@ -116,181 +129,285 @@ export function createDockerProvider({ policy, sourceDirectory }) {
   }
 
   async function remove(info) {
-    const meta = readExtra(info, provider);
-    await verifyDockerWorkspace(info, meta).catch((error) => {
-      if (isDockerNotFound(error)) return false;
-      throw error;
+    const meta = readMetadata(info, provider, policy);
+    const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
+    const identity = identityFromMetadata(meta);
+    return cleanupTransaction(meta.providerResourceID, async (cleanup) => {
+      await verifyExistingResources(refs, identity);
+      await cleanup.remove(`container:${refs.access}`, () => removeDocker('container', refs.access));
+      await cleanup.remove(`container:${refs.runtime}`, () => removeDocker('container', refs.runtime));
+      await cleanup.remove(`container:${refs.gateway}`, () => removeDocker('container', refs.gateway));
+      await cleanup.remove(`network:${refs.network}`, () => removeDocker('network', refs.network));
+      await cleanup.remove(`volume:${refs.secretVolume}`, () => removeDocker('volume', refs.secretVolume));
+      if (!policy.retention.preserveOnDelete) {
+        await cleanup.remove(`volume:${refs.mutableVolume}`, () => removeDocker('volume', refs.mutableVolume));
+        await cleanup.remove(`volume:${refs.baselineVolume}`, () => removeDocker('volume', refs.baselineVolume));
+      } else {
+        cleanup.retain(`volume:${refs.mutableVolume}`);
+        cleanup.retain(`volume:${refs.baselineVolume}`);
+      }
     });
-    const failures = [];
-    if (meta.runtime.accessContainer) {
-      await run('docker', ['rm', '-f', meta.runtime.accessContainer], { timeoutMs: 60_000 }).catch((error) => {
-        if (!isDockerNotFound(error)) failures.push(error);
-      });
-    }
-    await run('docker', ['rm', '-f', meta.runtime.container], { timeoutMs: 60_000 }).catch((error) => {
-      if (!isDockerNotFound(error)) failures.push(error);
-    });
-    const volumeExists = await verifyDockerVolume(info, meta).then(() => true).catch((error) => {
-      if (isDockerNotFound(error)) return false;
-      throw error;
-    });
-    if (!policy.retention.preserveOnDelete && volumeExists) {
-      await run('docker', ['volume', 'rm', meta.storage.volume], { timeoutMs: 60_000 }).catch((error) => {
-        if (!isDockerNotFound(error)) failures.push(error);
-      });
-    }
-    if (failures.length > 0) throw new Error(`Docker workspace cleanup failed: ${failures.map((error) => error.message).join('; ')}`);
-    await deleteWorkspaceToken(meta.auth.tokenRef).catch(() => undefined);
   }
 
   async function list(context) {
     if (!commandExists('docker')) throw new ProviderUnavailableError('Docker CLI is not available', { provider });
-    const filters = ['--filter', 'label=openchamber.managed=true', '--filter', 'label=openchamber.workspace.provider=docker', '--filter', 'label=openchamber.workspace.role=runtime'];
     const projectID = context?.instance?.project?.id;
-    if (projectID) filters.push('--filter', `label=openchamber.project.id=${projectID}`);
+    if (!projectID) throw new Error('Docker workspace discovery requires an authoritative project ID');
+    const filters = ['--filter', 'label=openchamber.managed=true', '--filter', 'label=openchamber.workspace.provider=docker', '--filter', 'label=openchamber.resource.role=runtime', '--filter', `label=openchamber.project.id=${labelHash(projectID)}`];
     const { stdout } = await run('docker', ['ps', '-a', ...filters, '--format', '{{json .}}'], { timeoutMs: 20_000 });
-    return stdout.split('\n').filter(Boolean).map((line) => {
+    const listed = [];
+    for (const line of stdout.split('\n').filter(Boolean)) {
       const row = JSON.parse(line);
-      const workspaceID = readDockerLabel(row.Labels, 'openchamber.workspace.id');
-      const project = projectID ?? readDockerLabel(row.Labels, 'openchamber.project.id') ?? 'unknown';
-      const id = workspaceID ?? row.Names ?? 'unknown';
-      return {
+      const providerResourceID = readDockerLabel(row.Labels, 'openchamber.resource.id');
+      if (!providerResourceID) continue;
+      const state = await readWorkspaceState(providerResourceID);
+      if (!state || state.projectID !== String(projectID) || state.provider !== provider) continue;
+      const identity = { provider, providerResourceID, projectID: String(projectID), controlPlaneWorkspaceID: state.controlPlaneWorkspaceID, originalControlPlaneWorkspaceID: state.originalControlPlaneWorkspaceID ?? state.controlPlaneWorkspaceID };
+      listed.push({
         type: provider,
-        name: row.Names ?? workspaceID ?? 'docker-workspace',
+        name: workspaceName(providerResourceID, provider),
         branch: null,
         directory: WORKSPACE_RUNTIME.directory,
-        extra: createExtra({ id, projectID: project }, provider, policy, {
-          storage: { type: 'docker-volume', volume: `openchamber-ws-${sanitizeLabelValue(id)}` },
-          runtime: { type: 'docker-container', container: row.Names, accessContainer: `${row.Names}-access` },
-        }),
-        projectID: project,
-      };
-    });
+        projectID: String(projectID),
+        extra: createMetadata({ id: state.controlPlaneWorkspaceID, projectID: String(projectID) }, provider, policy, canonicalResourceRefs(providerResourceID, provider, policy), identity),
+      });
+    }
+    return listed;
   }
 
-  async function exportDiff(info) {
-    const meta = readExtra(info, provider);
-    await verifyDockerWorkspace(info, meta);
-    const { stdout } = await run('docker', ['exec', meta.runtime.container, 'sh', '-lc', EXPORT_DIFF_COMMAND], { timeoutMs: 60_000 });
-    return { patch: stdout, provider };
+  async function exportWorkspace(info) {
+    const meta = readMetadata(info, provider, policy);
+    await verifyDockerWorkspace(meta);
+    const state = await readOwnedState(meta);
+    const snapshot = await runJson('docker', ['exec', meta.resourceRefs.runtime, 'node', '-e', RUNTIME_ARTIFACT_SCRIPT, WORKSPACE_RUNTIME.baselineDirectory, WORKSPACE_RUNTIME.directory, state.baselineGeneration, String(ARTIFACT_LIMITS.maxTextBytes), String(ARTIFACT_LIMITS.maxBlobBytes), String(ARTIFACT_LIMITS.maxTotalBytes)], { timeoutMs: 120_000, maxOutputBytes: ARTIFACT_LIMITS.maxOutputBytes, sensitiveOutput: true, sensitiveValues: [RUNTIME_ARTIFACT_SCRIPT] });
+    return { ...snapshot, provider, providerResourceID: meta.providerResourceID };
   }
 
-  return { kind: provider, configure, create, target, remove, list, health, exportDiff };
+  async function reconcile(info) {
+    const meta = readMetadata(info, provider, policy);
+    try {
+      await verifyDockerWorkspace(meta);
+      const state = await readOwnedState(meta);
+      const remote = await target(info);
+      await waitForHttpHealth(remote.url, remote.headers, { timeoutMs: 15_000 });
+      const repaired = [];
+      if (state.lifecycle !== 'ready') { await writeWorkspaceState(meta.providerResourceID, { ...state, lifecycle: 'ready', reconciledAt: new Date().toISOString() }); repaired.push('operation-journal'); }
+      return { provider, providerResourceID: meta.providerResourceID, status: 'ready', diagnostics: [], repaired };
+    } catch (error) {
+      return { provider, providerResourceID: meta.providerResourceID, status: 'degraded', diagnostics: [{ code: error?.code ?? 'WORKSPACE_RECONCILE_FAILED', message: error instanceof Error ? error.message : String(error) }], repaired: [] };
+    }
+  }
+
+  async function rotateCredentials(info, request = {}) {
+    const meta = readMetadata(info, provider, policy);
+    await verifyDockerWorkspace(meta);
+    await readOwnedState(meta);
+    const image = validateImage(policy, meta.imageDigest);
+    if (request.modelAuth != null && policy.credentials.modelAuth !== 'explicit-opencode-auth-content') throw new Error('Model authentication grants are disabled by workspace policy');
+    return rotateWorkspaceCredentials(meta.providerResourceID, request, async ({ token, modelAuth }) => { await verifyDockerWorkspace(meta); await updateSecretVolume(image, meta.resourceRefs.secretVolume, token, modelAuth); await run('docker', ['restart', meta.resourceRefs.runtime], { timeoutMs: 120_000 }); });
+  }
+
+  return { kind: provider, configure, create, target, remove, list, health, exportWorkspace, reconcile, rotateCredentials, validate: preflight };
 }
 
-async function startAccessProxy({ image, accessContainer, runtimeContainer, labels, policy }) {
+async function seedVolume(image, volume, mountPath, archivePath, generation) {
   await run('docker', [
-    'run', '-d',
-    '--name', accessContainer,
-    ...labels,
-    '--security-opt', 'no-new-privileges',
-    '--cap-drop', 'ALL',
-    '-p', `127.0.0.1::${WORKSPACE_RUNTIME.port}`,
-    '-e', `OPENCHAMBER_ACCESS_PROXY_TARGET=${runtimeContainer}`,
-    image,
-    'node', '-e', accessProxyScript(),
-  ], { timeoutMs: 120_000 });
-  if (policy.docker.networkMode && policy.docker.networkMode !== 'default') {
-    await run('docker', ['network', 'connect', policy.docker.networkMode, accessContainer], { timeoutMs: 60_000 });
+    'run', '--rm', '--user', '1000:1000', '--network', 'none', '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL',
+    '-v', `${volume}:${mountPath}`,
+    '-v', `${archivePath}:/source.tar:ro`, image, 'sh', '-lc',
+    `set -eu; tar --no-same-owner -xf /source.tar -C ${mountPath}; mkdir -p ${mountPath}/.openchamber-runtime; printf '%s' '${generation}' > ${mountPath}/.openchamber-runtime/source-generation`,
+  ], { timeoutMs: 300_000 });
+}
+
+async function verifyDockerSeed(image, volume, mountPath, generation) {
+  try {
+    const { stdout } = await run('docker', [
+      'run', '--rm', '--user', '1000:1000', '--network', 'none', '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL',
+      '-v', `${volume}:${mountPath}:ro`, image, 'node', '-e',
+      `process.stdout.write(require('fs').readFileSync('${mountPath}/.openchamber-runtime/source-generation','utf8'))`,
+    ], { timeoutMs: 60_000 });
+    return stdout === generation;
+  } catch {
+    return false;
   }
+}
+
+async function seedSecretVolume(image, secretVolume, secretDirectory) {
+  await run('docker', ['run', '--rm', '--user', '1000:1000', '--network', 'none', '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL', '-v', `${secretVolume}:${PROVIDER_SECRET_DIRECTORY}`, '-v', `${secretDirectory}:/input:ro`, image, 'sh', '-lc', `set -eu; cp /input/endpoint-token ${PROVIDER_TOKEN_FILE}; if [ -f /input/model-auth.json ]; then cp /input/model-auth.json ${PROVIDER_MODEL_AUTH_FILE}; fi; chmod 700 ${PROVIDER_SECRET_DIRECTORY}; chmod 400 ${PROVIDER_SECRET_DIRECTORY}/*`], { timeoutMs: 60_000 });
+}
+
+async function updateSecretVolume(image, secretVolume, token, modelAuth) {
+  const payload = JSON.stringify({ token, modelAuth });
+  await run('docker', ['run', '--rm', '-i', '--user', '1000:1000', '--network', 'none', '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL', '-v', `${secretVolume}:${PROVIDER_SECRET_DIRECTORY}`, image, 'node', '-e', `const fs=require('fs');let s='';const write=(p,v)=>{try{fs.chmodSync(p,0o600)}catch(e){if(e.code!=='ENOENT')throw e}fs.writeFileSync(p,v,{mode:0o600});fs.chmodSync(p,0o400)};process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{const v=JSON.parse(s);write('${PROVIDER_TOKEN_FILE}',v.token);if(v.modelAuth===undefined)fs.rmSync('${PROVIDER_MODEL_AUTH_FILE}',{force:true});else write('${PROVIDER_MODEL_AUTH_FILE}',v.modelAuth)})`], { input: payload, timeoutMs: 60_000, sensitiveOutput: true });
+}
+
+async function startAccessProxy({ image, refs, identity, hostPort }) {
+  await run('docker', [
+    'run', '-d', '--name', refs.access, ...labelArgs(providerLabels(identity, 'access-proxy')),
+    '--network', 'bridge', '--user', '1000:1000', '--read-only', '--tmpfs', '/tmp:rw,noexec,nosuid,size=32m',
+    '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL', '--pids-limit', '64',
+    '-p', `127.0.0.1:${hostPort}:${WORKSPACE_RUNTIME.port}`,
+    '-e', `OPENCHAMBER_ACCESS_PROXY_TARGET=${refs.runtime}`, image, 'node', '-e', accessProxyScript(),
+  ], { timeoutMs: 120_000 });
+}
+
+async function startEgressGateway({ runtimeImage, refs, identity, egress }) {
+  const common = [
+    'run', '-d', '--name', refs.gateway, ...labelArgs(providerLabels(identity, 'egress-gateway')),
+    '--network', 'bridge', '--read-only', '--tmpfs', '/tmp:rw,noexec,nosuid,size=32m',
+    '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL', '--pids-limit', '64',
+  ];
+  if (egress.mode === 'managed') {
+    await run('docker', [...common, '--user', '10001:10001', '-e', `OPENCHAMBER_RESOURCE_ID=${identity.providerResourceID}`, '-e', `OPENCHAMBER_EGRESS_POLICY=${JSON.stringify(egress.gatewayPolicy)}`, egress.gatewayImage], { timeoutMs: 120_000 });
+    return;
+  }
+  const proxy = new URL(egress.proxyUrl);
+  const targetHost = proxy.hostname === '127.0.0.1' || proxy.hostname === 'localhost' ? 'host.docker.internal' : proxy.hostname;
+  const targetPort = proxy.port || (proxy.protocol === 'http:' ? '80' : '443');
+  await run('docker', [
+    ...common, '--user', '1000:1000', '--add-host', 'host.docker.internal:host-gateway',
+    '-e', `OPENCHAMBER_PROXY_HOST=${targetHost}`, '-e', `OPENCHAMBER_PROXY_PORT=${targetPort}`,
+    '-e', `OPENCHAMBER_PROXY_TLS=${proxy.protocol === 'https:' ? 'true' : 'false'}`, '-e', `OPENCHAMBER_PROXY_SERVERNAME=${proxy.hostname}`,
+    runtimeImage, 'node', '-e', fixedProxyBridgeScript(),
+  ], { timeoutMs: 120_000 });
+}
+
+function fixedProxyBridgeScript() {
+  return "const net=require('node:net'),tls=require('node:tls');const host=process.env.OPENCHAMBER_PROXY_HOST,port=Number(process.env.OPENCHAMBER_PROXY_PORT),secure=process.env.OPENCHAMBER_PROXY_TLS==='true',servername=process.env.OPENCHAMBER_PROXY_SERVERNAME;if(!host||!port)throw new Error('proxy target required');net.createServer(s=>{const ready=()=>s.pipe(u).pipe(s);const u=secure?tls.connect({host,port,servername:net.isIP(servername)?undefined:servername},ready):net.connect(port,host,ready);u.setTimeout(5000,()=>{u.destroy();s.destroy()});u.once(secure?'secureConnect':'connect',()=>u.setTimeout(0));u.on('error',()=>s.destroy());s.on('error',()=>u.destroy())}).listen(3128,'0.0.0.0');";
 }
 
 function accessProxyScript() {
-  return `
-const net = require('node:net');
-const target = process.env.OPENCHAMBER_ACCESS_PROXY_TARGET;
-const port = ${WORKSPACE_RUNTIME.port};
-if (!target) throw new Error('OPENCHAMBER_ACCESS_PROXY_TARGET is required');
-net.createServer((socket) => {
-  const upstream = net.connect(port, target, () => {
-    upstream.setTimeout(0);
-    socket.pipe(upstream).pipe(socket);
-  });
-  upstream.setTimeout(5000, () => {
-    upstream.destroy();
-    socket.destroy();
-  });
-  upstream.on('error', () => socket.destroy());
-  socket.on('error', () => upstream.destroy());
-}).listen(port, '0.0.0.0');
-`;
+  return `const net=require('node:net');const target=process.env.OPENCHAMBER_ACCESS_PROXY_TARGET;net.createServer((socket)=>{const upstream=net.connect(${WORKSPACE_RUNTIME.port},target,()=>{upstream.setTimeout(0);socket.pipe(upstream).pipe(socket)});upstream.setTimeout(5000,()=>{upstream.destroy();socket.destroy()});upstream.on('error',()=>socket.destroy());socket.on('error',()=>upstream.destroy())}).listen(${WORKSPACE_RUNTIME.port},'0.0.0.0');`;
 }
 
-async function ensureDockerNetwork(policy) {
-  if (policy.docker.networkMode !== SECURE_DOCKER_NETWORK) return;
-  const labels = {
-    'openchamber.managed': 'true',
-    'openchamber.workspace.provider': 'docker',
-    'openchamber.workspace.network': 'secure',
-  };
-  const existing = await runJson('docker', ['network', 'inspect', SECURE_DOCKER_NETWORK], { timeoutMs: 20_000 }).catch((error) => {
-    if (isDockerNotFound(error)) return null;
+async function verifyDockerWorkspace(meta) {
+  const identity = identityFromMetadata(meta);
+  const refs = meta.resourceRefs;
+  await verifyDockerResource('container', refs.runtime, providerLabels(identity, 'runtime'), (entry) => hardenedContainer(entry) && exactNetworks(entry, [refs.network]));
+  await verifyDockerResource('container', refs.access, providerLabels(identity, 'access-proxy'), (entry) => hardenedContainer(entry) && exactNetworks(entry, ['bridge', refs.network]) && (entry?.Mounts ?? []).length === 0);
+  await verifyDockerResource('container', refs.gateway, providerLabels(identity, 'egress-gateway'), (entry) => hardenedContainer(entry, ['1000:1000', '10001:10001']) && exactNetworks(entry, ['bridge', refs.network]) && (entry?.Mounts ?? []).length === 0);
+  await verifyDockerResource('volume', refs.mutableVolume, providerLabels(identity, 'mutable-storage'));
+  await verifyDockerResource('volume', refs.baselineVolume, providerLabels(identity, 'baseline-storage'));
+  await verifyDockerResource('volume', refs.secretVolume, providerLabels(identity, 'secrets'));
+  await verifyDockerResource('network', refs.network, providerLabels(identity, 'network'), (entry) => entry.Internal === true);
+}
+
+async function verifyExistingResources(refs, identity) {
+  for (const [kind, name, role] of [['container', refs.runtime, 'runtime'], ['container', refs.access, 'access-proxy'], ['container', refs.gateway, 'egress-gateway'], ['volume', refs.mutableVolume, 'mutable-storage'], ['volume', refs.baselineVolume, 'baseline-storage'], ['volume', refs.secretVolume, 'secrets'], ['network', refs.network, 'network']]) {
+    await verifyDockerResource(kind, name, providerLabels(identity, role)).catch((error) => { if (!isDockerNotFound(error)) throw error; });
+  }
+}
+
+async function verifyDockerResource(kind, name, expectedLabels, extraCheck) {
+  const inspected = await runJson('docker', kind === 'container' ? ['inspect', name] : [kind, 'inspect', name], { timeoutMs: 20_000 });
+  const entry = inspected?.[0];
+  const labels = kind === 'container' ? entry?.Config?.Labels : entry?.Labels;
+  for (const [key, value] of Object.entries(expectedLabels)) if (labels?.[key] !== value) throw new OwnershipError(`Docker ${kind} ownership mismatch for ${name}: ${key}`);
+  if (extraCheck && !extraCheck(entry)) throw new OwnershipError(`Docker ${kind} security configuration mismatch: ${name}`);
+}
+
+async function dockerResourceExistsOwned(kind, name, expectedLabels) {
+  try {
+    await verifyDockerResource(kind, name, expectedLabels);
+    return true;
+  } catch (error) {
+    if (isDockerNotFound(error)) return false;
     throw error;
-  });
-  if (existing) {
-    const network = existing?.[0];
-    if (network?.Internal !== true) throw new Error(`Docker workspace network is not internal: ${SECURE_DOCKER_NETWORK}`);
-    const existingLabels = network?.Labels ?? {};
-    for (const [key, value] of Object.entries(labels)) {
-      if (existingLabels[key] !== value) throw new Error(`Docker workspace network label mismatch for ${key}`);
-    }
-    return;
-  }
-  await run('docker', [
-    'network', 'create', '--driver', 'bridge', '--internal',
-    ...Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]),
-    SECURE_DOCKER_NETWORK,
-  ], { timeoutMs: 60_000 });
-}
-
-async function verifyDockerWorkspace(info, meta) {
-  requireDockerManagedLabels(info, meta);
-  const inspected = await runJson('docker', ['inspect', meta.runtime.container], { timeoutMs: 20_000 });
-  const labels = inspected?.[0]?.Config?.Labels ?? {};
-  for (const [key, value] of Object.entries(meta.labels ?? {})) {
-    if (labels[key] !== String(value)) throw new Error(`Docker workspace container label mismatch for ${key}`);
   }
 }
 
-async function verifyDockerVolume(info, meta) {
-  requireDockerManagedLabels(info, meta);
-  const inspected = await runJson('docker', ['volume', 'inspect', meta.storage.volume], { timeoutMs: 20_000 });
-  const labels = inspected?.[0]?.Labels ?? {};
-  for (const [key, value] of Object.entries(meta.labels ?? {})) {
-    if (labels[key] !== String(value)) throw new Error(`Docker workspace volume label mismatch for ${key}`);
+async function assertResourcesAbsent(refs) {
+  for (const [kind, name] of [['container', refs.runtime], ['container', refs.access], ['container', refs.gateway], ['volume', refs.mutableVolume], ['volume', refs.baselineVolume], ['volume', refs.secretVolume], ['network', refs.network]]) {
+    const args = kind === 'container' ? ['inspect', name] : [kind, 'inspect', name];
+    const exists = await runJson('docker', args, { timeoutMs: 20_000 }).then(() => true).catch((error) => { if (isDockerNotFound(error)) return false; throw error; });
+    if (exists) throw new OwnershipError(`Docker resource collision: ${kind}/${name}`);
   }
 }
 
-function requireDockerManagedLabels(info, meta) {
-  const labels = meta.labels ?? {};
-  const required = {
-    'openchamber.managed': 'true',
-    'openchamber.workspace.provider': 'docker',
-    'openchamber.workspace.id': canonicalWorkspaceLabelID(info.id),
-  };
-  for (const [key, value] of Object.entries(required)) {
-    if (!value || labels[key] !== value) throw new Error(`Docker workspace metadata is missing required managed label: ${key}`);
-  }
+async function removeDocker(kind, name) {
+  const args = kind === 'container' ? ['rm', '-f', name] : [kind, 'rm', name];
+  await run('docker', args, { timeoutMs: 60_000 }).catch((error) => { if (!isDockerNotFound(error)) throw error; });
 }
 
-function isDockerNotFound(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /No such object|No such container|No such volume|not found/i.test(message);
+async function disconnectDockerNetwork(network, container) {
+  await run('docker', ['network', 'disconnect', '-f', network, container], { timeoutMs: 60_000 }).catch((error) => { if (!isDockerNotFound(error)) throw error; });
+}
+
+async function dockerContainerHasNetwork(container, network) {
+  try {
+    const inspected = await runJson('docker', ['inspect', container], { timeoutMs: 20_000 });
+    return Boolean(inspected?.[0]?.NetworkSettings?.Networks?.[network]);
+  } catch (error) {
+    if (isDockerNotFound(error)) return false;
+    throw error;
+  }
 }
 
 async function inspectPort(container) {
-  const inspected = await runJson('docker', ['inspect', container], { timeoutMs: 20_000 });
-  const entry = inspected?.[0];
-  const running = entry?.State?.Running === true;
-  if (!running) throw new Error(`Docker workspace container is not running: ${container}`);
-  const ports = entry?.NetworkSettings?.Ports?.[`${WORKSPACE_RUNTIME.port}/tcp`];
-  const port = Array.isArray(ports) ? ports[0]?.HostPort : undefined;
-  if (!port) throw new Error(`Docker workspace has no localhost port mapping: ${container}`);
-  return port;
+  const deadline = Date.now() + 5_000;
+  let binding;
+  do {
+    const inspected = await runJson('docker', ['inspect', container], { timeoutMs: 20_000 });
+    const entry = inspected?.[0];
+    if (entry?.State?.Running !== true) throw new Error(`Docker workspace container is not running: ${container}`);
+    binding = entry?.NetworkSettings?.Ports?.[`${WORKSPACE_RUNTIME.port}/tcp`]?.[0];
+    if (binding?.HostIp && binding?.HostPort) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (Date.now() < deadline);
+  if (binding?.HostIp !== '127.0.0.1' && binding?.HostIp !== '::1') throw new OwnershipError('Docker workspace target is not loopback-only');
+  if (!binding?.HostPort) throw new Error(`Docker workspace has no localhost port mapping: ${container}`);
+  return String(binding.HostPort);
+}
+
+function hardenedContainer(entry, users = ['1000:1000']) {
+  const host = entry?.HostConfig ?? {};
+  return users.includes(entry?.Config?.User)
+    && host.ReadonlyRootfs === true
+    && (host.CapDrop ?? []).includes('ALL')
+    && (host.SecurityOpt ?? []).some((value) => value === 'no-new-privileges' || value === 'no-new-privileges:true');
+}
+
+function exactNetworks(entry, expected) {
+  const actual = Object.keys(entry?.NetworkSettings?.Networks ?? {}).sort();
+  return actual.length === expected.length && actual.every((value, index) => value === [...expected].sort()[index]);
+}
+
+async function availableStablePort(providerResourceID) {
+  const digest = Number.parseInt(providerResourceID.slice(-4), 16);
+  for (let offset = 0; offset < 512; offset += 1) {
+    const port = 49152 + (digest + offset) % 16384;
+    if (await portAvailable(port)) return port;
+  }
+  throw new Error('Unable to allocate a stable loopback port');
+}
+
+function portAvailable(port) {
+  return new Promise((resolve) => {
+    const server = createServer();
+    server.once('error', () => resolve(false));
+    server.listen(port, '127.0.0.1', () => server.close(() => resolve(true)));
+  });
+}
+
+function identityFromMetadata(meta) {
+  return { provider: meta.provider, providerResourceID: meta.providerResourceID, projectID: meta.projectID, controlPlaneWorkspaceID: meta.controlPlaneWorkspaceID, originalControlPlaneWorkspaceID: meta.originalControlPlaneWorkspaceID ?? meta.controlPlaneWorkspaceID };
+}
+
+async function readOwnedState(meta) {
+  const state = await readWorkspaceState(meta.providerResourceID);
+  if (!state || state.provider !== meta.provider || state.projectID !== meta.projectID || state.controlPlaneWorkspaceID !== meta.controlPlaneWorkspaceID) throw new OwnershipError('Docker workspace state identity mismatch');
+  return state;
+}
+
+function labelArgs(labels) {
+  return Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]);
 }
 
 function readDockerLabel(labels, key) {
   if (typeof labels !== 'string') return undefined;
-  const item = labels.split(',').map((part) => part.trim()).find((part) => part.startsWith(`${key}=`));
-  return item?.slice(key.length + 1);
+  return labels.split(',').map((part) => part.trim()).find((part) => part.startsWith(`${key}=`))?.slice(key.length + 1);
+}
+
+function isDockerNotFound(error) {
+  return /No such object|No such container|No such volume|not found/i.test(error instanceof Error ? error.message : String(error));
 }

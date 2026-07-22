@@ -1,10 +1,12 @@
-FROM node:22-bookworm-slim
+ARG NODE_BASE_IMAGE
+FROM ${NODE_BASE_IMAGE}
 
-ARG OPENCODE_VERSION=1.17.18
+ARG OPENCODE_VERSION=1.18.4
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
+    build-essential \
     git \
     openssh-client \
     tar \
@@ -13,6 +15,10 @@ RUN apt-get update \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 
+RUN mkdir -p /workspace /baseline /run/openchamber-workspace \
+  && chown -R node:node /workspace /baseline /run/openchamber-workspace
+
+USER node
 WORKDIR /workspace
 
 CMD ["opencode", "--version"]
