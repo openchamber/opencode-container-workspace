@@ -6,11 +6,19 @@ on:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      registry_preflight:
+        description: Create public run-scoped GHCR candidates without a release tag
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 env:
+  OCI_SOURCE: https://github.com/${{ github.repository }}
+  OCI_REVISION: ${{ github.sha }}
+  OCI_VERSION: ${{ github.ref_name }}
   NODE_BASE_IMAGE: node@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3
   QEMU_IMAGE: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
   BUILDX_VERSION: v0.35.0
@@ -70,6 +78,9 @@ jobs:
             --file "${{ matrix.dockerfile }}" \
             --platform linux/amd64,linux/arm64 \
             --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" \
+            --label "org.opencontainers.image.source=${OCI_SOURCE}" \
+            --label "org.opencontainers.image.revision=${OCI_REVISION}" \
+            --label "org.opencontainers.image.version=${OCI_VERSION}" \
             --sbom=true \
             --provenance=mode=max \
             --output "type=oci,dest=/tmp/${{ matrix.name }}.tar"
@@ -82,7 +93,7 @@ jobs:
           trap cleanup EXIT
           for platform in linux/amd64 linux/arm64; do
             arch="${platform#linux/}"
-            docker buildx build . --file "${{ matrix.dockerfile }}" --platform "$platform" --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --load --tag "workspace-smoke:${{ matrix.name }}-$arch"
+            docker buildx build . --file "${{ matrix.dockerfile }}" --platform "$platform" --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --label "org.opencontainers.image.source=${OCI_SOURCE}" --label "org.opencontainers.image.revision=${OCI_REVISION}" --label "org.opencontainers.image.version=${OCI_VERSION}" --load --tag "workspace-smoke:${{ matrix.name }}-$arch"
             if [ "${{ matrix.name }}" = "opencode-workspace" ]; then
               docker run --rm "workspace-smoke:${{ matrix.name }}-$arch" opencode --version
               cid="$(docker run -d -p 127.0.0.1::4096 "workspace-smoke:${{ matrix.name }}-$arch" opencode serve --hostname 0.0.0.0 --port 4096)"
@@ -136,8 +147,8 @@ jobs:
         run: docker run --detach --name workspace-integration-registry --publish 127.0.0.1:5000:5000 "$REGISTRY_IMAGE"
       - name: Build and push native integration images
         run: |
-          docker build . --file runtime-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --tag 127.0.0.1:5000/workspace-integration/runtime:ci
-          docker build . --file egress-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --tag 127.0.0.1:5000/workspace-integration/gateway:ci
+          docker build . --file runtime-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --label "org.opencontainers.image.source=${OCI_SOURCE}" --label "org.opencontainers.image.revision=${OCI_REVISION}" --label "org.opencontainers.image.version=${OCI_VERSION}" --tag 127.0.0.1:5000/workspace-integration/runtime:ci
+          docker build . --file egress-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --label "org.opencontainers.image.source=${OCI_SOURCE}" --label "org.opencontainers.image.revision=${OCI_REVISION}" --label "org.opencontainers.image.version=${OCI_VERSION}" --tag 127.0.0.1:5000/workspace-integration/gateway:ci
           docker push 127.0.0.1:5000/workspace-integration/runtime:ci
           docker push 127.0.0.1:5000/workspace-integration/gateway:ci
       - name: Resolve integration image digests
@@ -198,8 +209,8 @@ jobs:
             --wait
       - name: Build and push native integration images
         run: |
-          docker build . --file runtime-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --tag 127.0.0.1:5000/workspace-integration/runtime:ci
-          docker build . --file egress-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --tag 127.0.0.1:5000/workspace-integration/gateway:ci
+          docker build . --file runtime-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --label "org.opencontainers.image.source=${OCI_SOURCE}" --label "org.opencontainers.image.revision=${OCI_REVISION}" --label "org.opencontainers.image.version=${OCI_VERSION}" --tag 127.0.0.1:5000/workspace-integration/runtime:ci
+          docker build . --file egress-image/Dockerfile --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" --label "org.opencontainers.image.source=${OCI_SOURCE}" --label "org.opencontainers.image.revision=${OCI_REVISION}" --label "org.opencontainers.image.version=${OCI_VERSION}" --tag 127.0.0.1:5000/workspace-integration/gateway:ci
           docker push 127.0.0.1:5000/workspace-integration/runtime:ci
           docker push 127.0.0.1:5000/workspace-integration/gateway:ci
       - name: Resolve integration image digests
@@ -259,6 +270,80 @@ jobs:
           k3d registry delete workspace-ci
           docker network rm k3d-workspace-ci 2>/dev/null || true
 
+  registry-preflight:
+    if: github.event_name == 'workflow_dispatch' && inputs.registry_preflight
+    needs: [test, image, docker-live, kubernetes-live]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: opencode-workspace
+            dockerfile: runtime-image/Dockerfile
+          - name: workspace-egress-gateway
+            dockerfile: egress-image/Dockerfile
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          image: ${{ env.QEMU_IMAGE }}
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build run-scoped registry candidate
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${{ matrix.name }}"
+          candidate="$image:preflight-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker buildx build . \
+            --file "${{ matrix.dockerfile }}" \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" \
+            --label "org.opencontainers.image.source=${OCI_SOURCE}" \
+            --label "org.opencontainers.image.revision=${OCI_REVISION}" \
+            --label "org.opencontainers.image.version=${OCI_VERSION}" \
+            --sbom=true --provenance=mode=max \
+            --tag "$candidate" --push --metadata-file /tmp/preflight-metadata.json
+          digest="$(node -e 'const v=require("/tmp/preflight-metadata.json");process.stdout.write(v["containerimage.digest"])')"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "reference=$image@$digest" >> "$GITHUB_OUTPUT"
+      - name: Scan and smoke exact registry candidate
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            trivy image --platform "$platform" --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "${{ steps.candidate.outputs.reference }}"
+            if [ "${{ matrix.name }}" = "opencode-workspace" ]; then
+              docker run --platform "$platform" --rm "${{ steps.candidate.outputs.reference }}" opencode --version
+            else
+              docker run --platform "$platform" --rm --entrypoint node "${{ steps.candidate.outputs.reference }}" --check /app/gateway.mjs
+            fi
+          done
+      - name: Make package public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api --method PATCH "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${{ matrix.name }}" --field visibility=public
+      - name: Verify unauthenticated exact-digest pull
+        run: |
+          docker logout ghcr.io
+          docker buildx imagetools inspect "${{ steps.candidate.outputs.reference }}"
+          docker pull --platform linux/amd64 "${{ steps.candidate.outputs.reference }}"
+          docker pull --platform linux/arm64 "${{ steps.candidate.outputs.reference }}"
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [test, image, docker-live, kubernetes-live]
@@ -305,6 +390,9 @@ jobs:
             --file "${{ matrix.dockerfile }}" \
             --platform linux/amd64,linux/arm64 \
             --build-arg "NODE_BASE_IMAGE=${NODE_BASE_IMAGE}" \
+            --label "org.opencontainers.image.source=${OCI_SOURCE}" \
+            --label "org.opencontainers.image.revision=${OCI_REVISION}" \
+            --label "org.opencontainers.image.version=${OCI_VERSION}" \
             --sbom=true --provenance=mode=max \
             --tag "$candidate" --push --metadata-file /tmp/candidate-metadata.json
           digest="$(node -e 'const v=require("/tmp/candidate-metadata.json");process.stdout.write(v["containerimage.digest"])')"
