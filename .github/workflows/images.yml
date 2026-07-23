@@ -334,10 +334,19 @@ jobs:
             fi
             docker image rm "${{ steps.candidate.outputs.reference }}"
           done
-      - name: Make package public
+      - name: Ensure package is public
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh api --method PATCH "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${{ matrix.name }}" --field visibility=public
+          PACKAGE_NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          token_url="https://ghcr.io/token?service=ghcr.io&scope=repository:${owner}/${PACKAGE_NAME}:pull"
+          if TOKEN_URL="$token_url" node -e 'const response=await fetch(process.env.TOKEN_URL,{headers:{accept:"application/json"}});if(!response.ok)process.exit(1);const body=await response.json();process.exit(typeof body.token==="string"||typeof body.access_token==="string"?0:1)'; then
+            echo "${owner}/${PACKAGE_NAME} already permits anonymous pulls"
+          else
+            gh api --method PATCH "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE_NAME}" --field visibility=public
+          fi
       - name: Verify unauthenticated exact-digest pull
         run: |
           docker logout ghcr.io
