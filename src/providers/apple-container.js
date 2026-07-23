@@ -64,24 +64,10 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
         async () => undefined,
         () => verifyAppleSeed(container, image, refs.baselineVolume, WORKSPACE_RUNTIME.baselineDirectory, sourceSnapshot.generation),
       );
-      await updateSecretVolume(container, image, refs.secretVolume, secrets.token, secrets.modelAuth);
+      await updateSecretVolume(container, image, refs.secretVolume, secrets.token, secrets.modelAuth, { initialize: true });
       const inspectedNetwork = await containerJson(['network', 'inspect', refs.network], { timeoutMs: 20_000 });
       const runtimeMeta = withAppleProxy({ policy }, inspectedNetwork?.[0]);
-      const args = [
-        'run', '--detach', '--name', refs.runtime, ...labelArgs(providerLabels(identity, 'runtime')),
-        '--network', refs.network, '--user', '1000:1000', '--read-only', '--cap-drop', 'ALL',
-        '--tmpfs', '/tmp',
-        '--publish', `127.0.0.1:${hostPort}:${WORKSPACE_RUNTIME.port}`,
-        '--volume', `${refs.mutableVolume}:${WORKSPACE_RUNTIME.directory}`,
-        '--volume', `${refs.baselineVolume}:${WORKSPACE_RUNTIME.baselineDirectory}:ro`,
-        '--volume', `${refs.secretVolume}:${PROVIDER_SECRET_DIRECTORY}:ro`,
-        '--workdir', WORKSPACE_RUNTIME.directory,
-        '--env', 'OPENCODE_EXPERIMENTAL_WORKSPACES=true',
-      ];
-      for (const [key, value] of Object.entries(runtimeEnvironment(runtimeMeta, PROVIDER_TOKEN_FILE))) args.push('--env', `${key}=${value}`);
-      if (policy.appleContainer.memoryLimit) args.push('--memory', String(policy.appleContainer.memoryLimit));
-      if (policy.appleContainer.cpuLimit) args.push('--cpus', String(policy.appleContainer.cpuLimit));
-      args.push(image, 'sh', '-lc', runtimeCommand(PROVIDER_TOKEN_FILE));
+      const args = appleRuntimeArgs({ policy, identity, refs, image, hostPort, runtimeMeta });
       await transaction.create(`container:${refs.runtime}`, () => container(args, { timeoutMs: 120_000 }), () => removeResource(container, 'container', refs.runtime), () => appleResourceExistsOwned(containerJson, 'container', refs.runtime, providerLabels(identity, 'runtime')));
       await verifyWorkspace(containerJson, meta);
       await health(info);
@@ -174,10 +160,23 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
   async function rotateCredentials(info, request = {}) {
     const meta = readMetadata(info, provider, policy);
     await verifyWorkspace(containerJson, meta);
-    await readOwnedState(meta);
+    const state = await readOwnedState(meta);
     const image = validateImage(policy, meta.imageDigest);
     if (request.modelAuth != null && policy.credentials.modelAuth !== 'explicit-opencode-auth-content') throw new Error('Model authentication grants are disabled by workspace policy');
-    return rotateWorkspaceCredentials(meta.providerResourceID, request, async ({ token, modelAuth }) => { await verifyWorkspace(containerJson, meta); await updateSecretVolume(container, image, meta.resourceRefs.secretVolume, token, modelAuth); await container(['stop', meta.resourceRefs.runtime], { timeoutMs: 60_000 }); await container(['start', meta.resourceRefs.runtime], { timeoutMs: 60_000 }); });
+    return rotateWorkspaceCredentials(meta.providerResourceID, request, async ({ token, modelAuth }) => {
+      const runtimeExists = await verifyCredentialRotationResources(containerJson, meta);
+      if (runtimeExists) await removeResource(container, 'container', meta.resourceRefs.runtime);
+      await updateSecretVolume(container, image, meta.resourceRefs.secretVolume, token, modelAuth);
+      const inspectedNetwork = await containerJson(['network', 'inspect', meta.resourceRefs.network], { timeoutMs: 20_000 });
+      const runtimeMeta = withAppleProxy({ policy }, inspectedNetwork?.[0]);
+      const args = appleRuntimeArgs({ policy, identity: identityFromMetadata(meta), refs: meta.resourceRefs, image, hostPort: state.hostPort, runtimeMeta });
+      await container(args, { timeoutMs: 120_000 });
+      await verifyWorkspace(containerJson, meta);
+      const inspected = await containerJson(['inspect', meta.resourceRefs.runtime], { timeoutMs: 20_000 });
+      const port = inspectPort(inspected?.[0]);
+      if (String(port) !== String(state.hostPort)) throw new OwnershipError('Apple Container rotated runtime port does not match persisted state');
+      await waitForHttpHealth(`http://127.0.0.1:${port}`, { 'x-openchamber-workspace-token': token }, { timeoutMs: 90_000 });
+    });
   }
 
   return { kind: provider, configure, create, target, remove, list, health, exportWorkspace, reconcile, rotateCredentials, validate: preflight };
@@ -196,9 +195,31 @@ async function verifyAppleSeed(container, image, volume, mountPath, generation) 
   }
 }
 
-async function updateSecretVolume(container, image, secretVolume, token, modelAuth) {
-  const payload = JSON.stringify({ token, modelAuth });
-  await container(['run', '--rm', '-i', '--user', '0:0', '--network', 'none', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--volume', `${secretVolume}:${PROVIDER_SECRET_DIRECTORY}`, image, 'node', '-e', `const fs=require('fs');let s='';const write=(p,v)=>{try{fs.chmodSync(p,0o600)}catch(e){if(e.code!=='ENOENT')throw e}fs.writeFileSync(p,v,{mode:0o600});fs.chmodSync(p,0o400);fs.chownSync(p,1000,1000)};process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{const v=JSON.parse(s);write('${PROVIDER_TOKEN_FILE}',v.token);if(v.modelAuth===undefined)fs.rmSync('${PROVIDER_MODEL_AUTH_FILE}',{force:true});else write('${PROVIDER_MODEL_AUTH_FILE}',v.modelAuth);fs.chmodSync('${PROVIDER_SECRET_DIRECTORY}',0o700);fs.chownSync('${PROVIDER_SECRET_DIRECTORY}',1000,1000)})`], { input: payload, timeoutMs: 60_000, sensitiveOutput: true });
+async function updateSecretVolume(container, image, secretVolume, token, modelAuth, { initialize = false } = {}) {
+  const payload = JSON.stringify({ token, modelAuth, initialize });
+  const args = ['run', '--rm', '-i', '--user', initialize ? '0:0' : '1000:1000', '--network', 'none', '--cap-drop', 'ALL'];
+  if (initialize) args.push('--cap-add', 'CHOWN');
+  args.push('--volume', `${secretVolume}:${PROVIDER_SECRET_DIRECTORY}`, image, 'node', '-e', `const fs=require('fs');let s='';const write=(p,v,i)=>{try{fs.chmodSync(p,0o600)}catch(e){if(e.code!=='ENOENT')throw e}fs.writeFileSync(p,v,{mode:0o600});fs.chmodSync(p,0o400);if(i)fs.chownSync(p,1000,1000)};process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{const v=JSON.parse(s);write('${PROVIDER_TOKEN_FILE}',v.token,v.initialize);if(v.modelAuth===undefined)fs.rmSync('${PROVIDER_MODEL_AUTH_FILE}',{force:true});else write('${PROVIDER_MODEL_AUTH_FILE}',v.modelAuth,v.initialize);fs.chmodSync('${PROVIDER_SECRET_DIRECTORY}',0o700);if(v.initialize)fs.chownSync('${PROVIDER_SECRET_DIRECTORY}',1000,1000)})`);
+  await container(args, { input: payload, timeoutMs: 60_000, sensitiveOutput: true });
+}
+
+function appleRuntimeArgs({ policy, identity, refs, image, hostPort, runtimeMeta }) {
+  const args = [
+    'run', '--detach', '--name', refs.runtime, ...labelArgs(providerLabels(identity, 'runtime')),
+    '--network', refs.network, '--user', '1000:1000', '--read-only', '--cap-drop', 'ALL',
+    '--tmpfs', '/tmp',
+    '--publish', `127.0.0.1:${hostPort}:${WORKSPACE_RUNTIME.port}`,
+    '--volume', `${refs.mutableVolume}:${WORKSPACE_RUNTIME.directory}`,
+    '--volume', `${refs.baselineVolume}:${WORKSPACE_RUNTIME.baselineDirectory}:ro`,
+    '--volume', `${refs.secretVolume}:${PROVIDER_SECRET_DIRECTORY}:ro`,
+    '--workdir', WORKSPACE_RUNTIME.directory,
+    '--env', 'OPENCODE_EXPERIMENTAL_WORKSPACES=true',
+  ];
+  for (const [key, value] of Object.entries(runtimeEnvironment(runtimeMeta, PROVIDER_TOKEN_FILE))) args.push('--env', `${key}=${value}`);
+  if (policy.appleContainer.memoryLimit) args.push('--memory', String(policy.appleContainer.memoryLimit));
+  if (policy.appleContainer.cpuLimit) args.push('--cpus', String(policy.appleContainer.cpuLimit));
+  args.push(image, 'sh', '-lc', runtimeCommand(PROVIDER_TOKEN_FILE));
+  return args;
 }
 
 async function verifyWorkspace(containerJson, meta) {
@@ -213,6 +234,18 @@ async function verifyWorkspace(containerJson, meta) {
 async function verifyExisting(containerJson, meta) {
   const identity = identityFromMetadata(meta);
   for (const [kind, name, role] of [['container', meta.resourceRefs.runtime, 'runtime'], ['volume', meta.resourceRefs.mutableVolume, 'mutable-storage'], ['volume', meta.resourceRefs.baselineVolume, 'baseline-storage'], ['volume', meta.resourceRefs.secretVolume, 'secrets'], ['network', meta.resourceRefs.network, 'network']]) await verifyResource(containerJson, kind, name, providerLabels(identity, role)).catch((error) => { if (!isNotFound(error)) throw error; });
+}
+
+async function verifyCredentialRotationResources(containerJson, meta) {
+  const identity = identityFromMetadata(meta);
+  await verifyResource(containerJson, 'volume', meta.resourceRefs.mutableVolume, providerLabels(identity, 'mutable-storage'));
+  await verifyResource(containerJson, 'volume', meta.resourceRefs.baselineVolume, providerLabels(identity, 'baseline-storage'));
+  await verifyResource(containerJson, 'volume', meta.resourceRefs.secretVolume, providerLabels(identity, 'secrets'));
+  await verifyResource(containerJson, 'network', meta.resourceRefs.network, providerLabels(identity, 'network'), (entry) => entry?.configuration?.mode === 'hostOnly');
+  return verifyResource(containerJson, 'container', meta.resourceRefs.runtime, providerLabels(identity, 'runtime')).then(() => true).catch((error) => {
+    if (isNotFound(error)) return false;
+    throw error;
+  });
 }
 
 async function verifyResource(containerJson, kind, name, expected, check) {
