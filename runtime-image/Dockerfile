@@ -2,7 +2,7 @@ ARG NODE_BASE_IMAGE
 FROM ${NODE_BASE_IMAGE}
 
 ARG OPENCODE_VERSION=1.18.8
-ARG NPM_VERSION=12.0.1
+ARG NPM_VERSION=11.18.0
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
