@@ -55,7 +55,7 @@ describe('host workspace transport shim', () => {
     acceptedOrigin = `http://127.0.0.1:${upstream.port}`;
     const workspace = await fixture(upstream.port, 'first-token');
 
-    const first = await request(workspace.shim.url, '/echo', {
+    const first = await request(workspace.shim.url, '/echo?directory=%2Fforeign', {
       method: 'POST',
       body: 'payload',
       headers: {
@@ -67,6 +67,7 @@ describe('host workspace transport shim', () => {
     expect(first).toMatchObject({ status: 200, body: 'payload' });
     expect(first.headers['set-cookie']).toBeUndefined();
     expect(first.headers['x-openchamber-private']).toBeUndefined();
+    expect(seen[0].path).toBe('/echo?directory=%2Fworkspace');
     expect(seen[0].headers[TOKEN_HEADER]).toBe('first-token');
     expect(seen[0].headers.origin).toBe(acceptedOrigin);
     expect(seen[0].headers['content-length']).toBe('7');
@@ -95,8 +96,10 @@ describe('host workspace transport shim', () => {
       headers.push('Set-Cookie: forbidden=session');
       headers.push('X-OpenChamber-Private: hidden');
     });
+    let upstreamUrl;
     wss.on('connection', (socket, request) => {
       upstreamHeaders = request.headers;
+      upstreamUrl = request.url;
       socket.on('message', (data, binary) => socket.send(data, { binary }));
     });
     server.server.on('upgrade', (request, socket, head) => {
@@ -109,7 +112,7 @@ describe('host workspace transport shim', () => {
     acceptedOrigin = `http://127.0.0.1:${server.port}`;
     const workspace = await fixture(server.port, 'websocket-token');
 
-    const result = await websocketRoundTrip(workspace.shim.url.replace('http:', 'ws:'), Buffer.from([0, 1, 2, 255]), ['opencode-v1'], { origin: 'https://attacker.example', headers: { referer: 'https://attacker.example/path' } });
+    const result = await websocketRoundTrip(`${workspace.shim.url.replace('http:', 'ws:')}?directory=%2Fforeign`, Buffer.from([0, 1, 2, 255]), ['opencode-v1'], { origin: 'https://attacker.example', headers: { referer: 'https://attacker.example/path' } });
     expect(result.protocol).toBe('opencode-v1');
     expect(result.binary).toBe(true);
     expect([...result.data]).toEqual([0, 1, 2, 255]);
@@ -117,6 +120,7 @@ describe('host workspace transport shim', () => {
     expect(upstreamHeaders.origin).toBe(acceptedOrigin);
     expect(upstreamHeaders.referer).toBeUndefined();
     expect(upstreamHeaders['sec-websocket-protocol']).toBe('opencode-v1');
+    expect(upstreamUrl).toBe('/?directory=%2Fworkspace');
     wss.close();
   });
 
@@ -131,11 +135,13 @@ describe('host workspace transport shim', () => {
     const foreign = await createIdentity();
     await expect(ensureTransportShim({
       identity: foreign,
+      runtimeDirectory: '/workspace',
       targetPolicy: { mode: 'loopback' },
       getTarget: async () => ({ type: 'remote', url: 'http://169.254.169.254:80', headers: { [TOKEN_HEADER]: 'token' } }),
     })).rejects.toThrow(/approved loopback/);
     await expect(ensureTransportShim({
       identity: foreign,
+      runtimeDirectory: '/workspace',
       targetPolicy: { mode: 'loopback' },
       getTarget: async () => ({ type: 'remote', url: `http://127.0.0.1:${upstream.port}`, headers: { [TOKEN_HEADER]: 'wrong', authorization: 'extra' } }),
     })).rejects.toThrow(/authentication/);
@@ -172,6 +178,7 @@ describe('host workspace transport shim', () => {
     const identity = await createIdentity();
     const shim = await ensureTransportShim({
       identity,
+      runtimeDirectory: '/workspace',
       targetPolicy: { mode: 'https', origin: `https://localhost:${port}` },
       getTarget: async () => ({ type: 'remote', url: `https://localhost:${port}`, headers: { [TOKEN_HEADER]: 'token' } }),
     });
@@ -206,6 +213,7 @@ describe('host workspace transport shim', () => {
 
     await expect(ensureTransportShim({
       identity: { ...identity, projectID: 'foreign-project' },
+      runtimeDirectory: '/workspace',
       targetPolicy: { mode: 'loopback' },
       getTarget: async () => target(upstream.port, 'token'),
     })).rejects.toThrow(/reassignment/);
@@ -225,7 +233,7 @@ describe('host workspace transport shim', () => {
       }
       return target(original.port, 'token');
     };
-    const shim = await ensureTransportShim({ identity, targetPolicy: { mode: 'loopback' }, getTarget });
+    const shim = await ensureTransportShim({ identity, runtimeDirectory: '/workspace', targetPolicy: { mode: 'loopback' }, getTarget });
     await closeServer(original.server);
     servers.delete(original.server);
 
@@ -265,7 +273,7 @@ describe('host workspace transport shim', () => {
   }
 
   function ensureFor(identity, upstreamPort, tokenValue) {
-    return ensureTransportShim({ identity, targetPolicy: { mode: 'loopback' }, getTarget: async () => target(upstreamPort, tokenValue) });
+    return ensureTransportShim({ identity, runtimeDirectory: '/workspace', targetPolicy: { mode: 'loopback' }, getTarget: async () => target(upstreamPort, tokenValue) });
   }
 
   function target(port, tokenValue) {

@@ -40,6 +40,16 @@ export default async function openchamberWorkspacePlugin(input, options = {}) {
       },
       async create(info, env, from, context) {
         await provider.create(info, env, from, context);
+        try {
+          await ensureTransportShim(transportShimOptions(provider, info, policy, context));
+        } catch (cause) {
+          try {
+            await provider.remove(info, context);
+          } catch (cleanupError) {
+            throw new AggregateError([cause, cleanupError], `Workspace transport startup failed and provider cleanup was incomplete: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+          }
+          throw cause;
+        }
       },
       async remove(info, context) {
         const providerResourceID = readMetadata(info, provider.kind, policy).providerResourceID;
@@ -50,12 +60,7 @@ export default async function openchamberWorkspacePlugin(input, options = {}) {
         }
       },
       async target(info, context) {
-        const metadata = readMetadata(info, provider.kind, policy);
-        return ensureTransportShim({
-          identity: metadata,
-          getTarget: () => provider.target(info, context),
-          targetPolicy: transportTargetPolicy(provider.kind, policy, metadata.providerResourceID),
-        });
+        return ensureTransportShim(transportShimOptions(provider, info, policy, context));
       },
       async list(context) {
         return provider.list(context);
@@ -64,6 +69,16 @@ export default async function openchamberWorkspacePlugin(input, options = {}) {
   }
 
   return { openchamber: { secureWorkspaces: { registered: true } } };
+}
+
+function transportShimOptions(provider, info, policy, context) {
+  const metadata = readMetadata(info, provider.kind, policy);
+  return {
+    identity: metadata,
+    getTarget: () => provider.target(info, context),
+    targetPolicy: transportTargetPolicy(provider.kind, policy, metadata.providerResourceID),
+    runtimeDirectory: info.directory,
+  };
 }
 
 function transportTargetPolicy(provider, policy, providerResourceID) {

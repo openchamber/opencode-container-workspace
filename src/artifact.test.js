@@ -85,6 +85,38 @@ describe('structured export artifacts', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('limits exported blobs instead of unchanged source content', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'artifact-limit-test-'));
+    const baseline = join(root, 'baseline');
+    const workspace = join(root, 'workspace');
+    await mkdir(baseline); await mkdir(workspace);
+    const unchanged = 'unchanged source content';
+    await writeFile(join(baseline, 'unchanged'), unchanged);
+    await writeFile(join(workspace, 'unchanged'), unchanged);
+    await writeFile(join(workspace, 'added'), 'ok');
+    try {
+      const snapshot = await runJson(process.execPath, ['-e', RUNTIME_ARTIFACT_SCRIPT, baseline, workspace, 'generation', '100', '100', '10'], { sensitiveValues: [RUNTIME_ARTIFACT_SCRIPT] });
+      expect(snapshot.files).toEqual([expect.objectContaining({ kind: 'add', newPath: 'added' })]);
+      expect(snapshot.totalBytes).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects artifacts whose changed blobs exceed the total limit', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'artifact-changed-limit-test-'));
+    const baseline = join(root, 'baseline');
+    const workspace = join(root, 'workspace');
+    await mkdir(baseline); await mkdir(workspace);
+    await writeFile(join(baseline, 'modified'), 'before');
+    await writeFile(join(workspace, 'modified'), 'after!');
+    try {
+      await expect(runJson(process.execPath, ['-e', RUNTIME_ARTIFACT_SCRIPT, baseline, workspace, 'generation', '100', '100', '10'], { sensitiveValues: [RUNTIME_ARTIFACT_SCRIPT] })).rejects.toThrow(/failed with 1/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 function runtimeSnapshot(baseline, workspace) {

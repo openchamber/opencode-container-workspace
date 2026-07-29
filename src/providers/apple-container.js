@@ -48,10 +48,10 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
       const secrets = await createWorkspaceSecrets(meta.providerResourceID, selectGrantedCredentials(policy, env));
       const hostPort = await availableStablePort(meta.providerResourceID);
       await transaction.update({ hostPort, imageDigest: image });
-      await transaction.create(`network:${refs.network}`, () => container(['network', 'create', '--internal', ...labelArgs(providerLabels(identity, 'network')), refs.network], { timeoutMs: 60_000 }), () => removeResource(container, 'network', refs.network), () => appleResourceExistsOwned(containerJson, 'network', refs.network, providerLabels(identity, 'network')));
-      await transaction.create(`volume:${refs.mutableVolume}`, () => container(['volume', 'create', ...labelArgs(providerLabels(identity, 'mutable-storage')), refs.mutableVolume], { timeoutMs: 60_000 }), () => removeResource(container, 'volume', refs.mutableVolume), () => appleResourceExistsOwned(containerJson, 'volume', refs.mutableVolume, providerLabels(identity, 'mutable-storage')));
-      await transaction.create(`volume:${refs.baselineVolume}`, () => container(['volume', 'create', ...labelArgs(providerLabels(identity, 'baseline-storage')), refs.baselineVolume], { timeoutMs: 60_000 }), () => removeResource(container, 'volume', refs.baselineVolume), () => appleResourceExistsOwned(containerJson, 'volume', refs.baselineVolume, providerLabels(identity, 'baseline-storage')));
-      await transaction.create(`volume:${refs.secretVolume}`, () => container(['volume', 'create', ...labelArgs(providerLabels(identity, 'secrets')), refs.secretVolume], { timeoutMs: 60_000 }), () => removeResource(container, 'volume', refs.secretVolume), () => appleResourceExistsOwned(containerJson, 'volume', refs.secretVolume, providerLabels(identity, 'secrets')));
+      await transaction.create(`network:${refs.network}`, () => container(['network', 'create', '--internal', ...labelArgs(providerLabels(identity, 'network')), refs.network], { timeoutMs: 60_000 }), () => removeResource(container, containerJson, 'network', refs.network), () => appleResourceExistsOwned(containerJson, 'network', refs.network, providerLabels(identity, 'network')));
+      await transaction.create(`volume:${refs.mutableVolume}`, () => container(['volume', 'create', ...labelArgs(providerLabels(identity, 'mutable-storage')), refs.mutableVolume], { timeoutMs: 60_000 }), () => removeResource(container, containerJson, 'volume', refs.mutableVolume), () => appleResourceExistsOwned(containerJson, 'volume', refs.mutableVolume, providerLabels(identity, 'mutable-storage')));
+      await transaction.create(`volume:${refs.baselineVolume}`, () => container(['volume', 'create', ...labelArgs(providerLabels(identity, 'baseline-storage')), refs.baselineVolume], { timeoutMs: 60_000 }), () => removeResource(container, containerJson, 'volume', refs.baselineVolume), () => appleResourceExistsOwned(containerJson, 'volume', refs.baselineVolume, providerLabels(identity, 'baseline-storage')));
+      await transaction.create(`volume:${refs.secretVolume}`, () => container(['volume', 'create', ...labelArgs(providerLabels(identity, 'secrets')), refs.secretVolume], { timeoutMs: 60_000 }), () => removeResource(container, containerJson, 'volume', refs.secretVolume), () => appleResourceExistsOwned(containerJson, 'volume', refs.secretVolume, providerLabels(identity, 'secrets')));
       await transaction.create(
         `seed:${refs.mutableVolume}`,
         () => seedVolume(container, image, refs.mutableVolume, WORKSPACE_RUNTIME.directory, sourceSnapshot.archivePath, sourceSnapshot.generation),
@@ -68,7 +68,7 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
       const inspectedNetwork = await containerJson(['network', 'inspect', refs.network], { timeoutMs: 20_000 });
       const runtimeMeta = withAppleProxy({ policy }, inspectedNetwork?.[0]);
       const args = appleRuntimeArgs({ policy, identity, refs, image, hostPort, runtimeMeta });
-      await transaction.create(`container:${refs.runtime}`, () => container(args, { timeoutMs: 120_000 }), () => removeResource(container, 'container', refs.runtime), () => appleResourceExistsOwned(containerJson, 'container', refs.runtime, providerLabels(identity, 'runtime')));
+      await transaction.create(`container:${refs.runtime}`, () => container(args, { timeoutMs: 120_000 }), () => removeResource(container, containerJson, 'container', refs.runtime), () => appleResourceExistsOwned(containerJson, 'container', refs.runtime, providerLabels(identity, 'runtime')));
       await verifyWorkspace(containerJson, meta);
       await health(info);
       } finally {
@@ -99,12 +99,12 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
     const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
     return cleanupTransaction(meta.providerResourceID, async (cleanup) => {
       await verifyExisting(containerJson, meta);
-      await cleanup.remove(`container:${refs.runtime}`, () => removeResource(container, 'container', refs.runtime));
-      await cleanup.remove(`network:${refs.network}`, () => removeResource(container, 'network', refs.network));
-      await cleanup.remove(`volume:${refs.secretVolume}`, () => removeResource(container, 'volume', refs.secretVolume));
+      await cleanup.remove(`container:${refs.runtime}`, () => removeResource(container, containerJson, 'container', refs.runtime));
+      await cleanup.remove(`network:${refs.network}`, () => removeResource(container, containerJson, 'network', refs.network));
+      await cleanup.remove(`volume:${refs.secretVolume}`, () => removeResource(container, containerJson, 'volume', refs.secretVolume));
       if (!policy.retention.preserveOnDelete) {
-        await cleanup.remove(`volume:${refs.mutableVolume}`, () => removeResource(container, 'volume', refs.mutableVolume));
-        await cleanup.remove(`volume:${refs.baselineVolume}`, () => removeResource(container, 'volume', refs.baselineVolume));
+        await cleanup.remove(`volume:${refs.mutableVolume}`, () => removeResource(container, containerJson, 'volume', refs.mutableVolume));
+        await cleanup.remove(`volume:${refs.baselineVolume}`, () => removeResource(container, containerJson, 'volume', refs.baselineVolume));
       } else {
         cleanup.retain(`volume:${refs.mutableVolume}`);
         cleanup.retain(`volume:${refs.baselineVolume}`);
@@ -165,7 +165,7 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
     if (request.modelAuth != null && policy.credentials.modelAuth !== 'explicit-opencode-auth-content') throw new Error('Model authentication grants are disabled by workspace policy');
     return rotateWorkspaceCredentials(meta.providerResourceID, request, async ({ token, modelAuth }) => {
       const runtimeExists = await verifyCredentialRotationResources(containerJson, meta);
-      if (runtimeExists) await removeResource(container, 'container', meta.resourceRefs.runtime);
+      if (runtimeExists) await removeResource(container, containerJson, 'container', meta.resourceRefs.runtime);
       await updateSecretVolume(container, image, meta.resourceRefs.secretVolume, token, modelAuth);
       const inspectedNetwork = await containerJson(['network', 'inspect', meta.resourceRefs.network], { timeoutMs: 20_000 });
       const runtimeMeta = withAppleProxy({ policy }, inspectedNetwork?.[0]);
@@ -274,9 +274,19 @@ async function assertResourcesAbsent(containerJson, refs) {
   }
 }
 
-async function removeResource(container, kind, name) {
+async function removeResource(container, containerJson, kind, name) {
   const args = kind === 'container' ? ['delete', '--force', name] : [kind, 'delete', name];
-  await container(args, { timeoutMs: 60_000 }).catch((error) => { if (!isNotFound(error)) throw error; });
+  try {
+    await container(args, { timeoutMs: 60_000 });
+  } catch (error) {
+    if (isNotFound(error)) return;
+    const inspectArgs = kind === 'container' ? ['inspect', name] : [kind, 'inspect', name];
+    const absent = await containerJson(inspectArgs, { timeoutMs: 20_000 }).then(() => false).catch((inspectError) => {
+      if (isNotFound(inspectError)) return true;
+      throw error;
+    });
+    if (!absent) throw error;
+  }
 }
 
 function inspectPort(entry) {

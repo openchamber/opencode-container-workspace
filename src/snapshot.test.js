@@ -1,24 +1,29 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSourceSnapshot, scanSourceTree } from './snapshot.js';
+import { run } from './process.js';
 
 describe('safe source snapshots', () => {
   const roots = [];
   afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
   async function fixture() { const root = await mkdtemp(join(tmpdir(), 'source-snapshot-test-')); roots.push(root); return root; }
 
-  it('records dirty Git, non-Git files, binary content, modes, and safe symlinks', async () => {
+  it('excludes Git internals while recording source files, modes, and safe symlinks', async () => {
     const root = await fixture();
     await mkdir(join(root, '.git'));
     await writeFile(join(root, '.git', 'index'), 'dirty-index');
+    await link(join(root, '.git', 'index'), join(root, '.git', 'COMMIT_EDITMSG'));
     await writeFile(join(root, 'binary.dat'), Buffer.from([0, 1, 2, 3]));
     await writeFile(join(root, 'script.sh'), '#!/bin/sh\n');
     await chmod(join(root, 'script.sh'), 0o755);
     await symlink('script.sh', join(root, 'link'));
     const snapshot = await createSourceSnapshot(root);
-    expect(snapshot.entries).toEqual(expect.arrayContaining([expect.objectContaining({ path: '.git/index', type: 'file' }), expect.objectContaining({ path: 'script.sh', mode: 0o755 }), expect.objectContaining({ path: 'link', type: 'symlink', target: 'script.sh' })]));
+    expect(snapshot.entries).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'script.sh', mode: 0o755 }), expect.objectContaining({ path: 'link', type: 'symlink', target: 'script.sh' })]));
+    expect(snapshot.entries.some((entry) => entry.path.startsWith('.git/'))).toBe(false);
+    const archive = await run('tar', ['-tf', snapshot.archivePath]);
+    expect(archive.stdout).not.toContain('.git/');
     expect(snapshot.generation).toMatch(/^[a-f0-9]{64}$/);
     await snapshot.dispose();
   });
@@ -31,6 +36,20 @@ describe('safe source snapshots', () => {
     const snapshot = await createSourceSnapshot(root, { temporaryRoot: staging });
 
     expect(snapshot.archivePath.startsWith(`${staging}/openchamber-source-`)).toBe(true);
+    await snapshot.dispose();
+  });
+
+  it('snapshots hard-linked regular source files', async () => {
+    const root = await fixture();
+    await writeFile(join(root, 'LICENSE'), 'license');
+    await link(join(root, 'LICENSE'), join(root, 'LICENSE.copy'));
+
+    const snapshot = await createSourceSnapshot(root);
+
+    expect(snapshot.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: 'LICENSE', type: 'file' }),
+      expect.objectContaining({ path: 'LICENSE.copy', type: 'file' }),
+    ]));
     await snapshot.dispose();
   });
 

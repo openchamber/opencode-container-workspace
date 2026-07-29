@@ -7,6 +7,7 @@ import { run } from './process.js';
 
 const DEFAULT_LIMITS = Object.freeze({ maxEntries: 100_000, maxBytes: 2 * 1024 ** 3, maxFileBytes: 256 * 1024 ** 2 });
 const RESERVED_ROOTS = new Set(['.openchamber', '.openchamber-runtime']);
+const EXCLUDED_ROOTS = new Set(['.git']);
 
 export async function createSourceSnapshot(sourceDirectory, options = {}) {
   const root = await realpath(sourceDirectory);
@@ -19,7 +20,7 @@ export async function createSourceSnapshot(sourceDirectory, options = {}) {
   await chmod(temporaryDirectory, 0o700);
   const archivePath = join(temporaryDirectory, 'source.tar');
   try {
-    await run('tar', ['-cf', archivePath, '.'], { cwd: root, env: { COPYFILE_DISABLE: '1' }, timeoutMs: options.timeoutMs ?? 300_000, maxOutputBytes: 64 * 1024 });
+    await run('tar', ['-cf', archivePath, '--exclude', './.git', '.'], { cwd: root, env: { COPYFILE_DISABLE: '1' }, timeoutMs: options.timeoutMs ?? 300_000, maxOutputBytes: 64 * 1024 });
     const after = await scanSourceTree(root, limits);
     if (JSON.stringify(before.entries) !== JSON.stringify(after.entries)) throw new Error('Workspace source changed while the immutable snapshot was being created');
     const generation = createHash('sha256').update(JSON.stringify(before.entries.map(({ mtimeNs, ...entry }) => entry))).digest('hex');
@@ -43,6 +44,7 @@ export async function scanSourceTree(root, limits = DEFAULT_LIMITS) {
   async function visit(directory, relativeDirectory = '') {
     const names = (await readdir(directory)).sort((left, right) => Buffer.from(left).compare(Buffer.from(right)));
     for (const name of names) {
+      if (!relativeDirectory && EXCLUDED_ROOTS.has(name)) continue;
       if (!relativeDirectory && RESERVED_ROOTS.has(name)) throw new Error(`Workspace source contains reserved control path: ${name}`);
       if (name.includes('\0')) throw new Error('Workspace source path contains NUL');
       const relativePath = relativeDirectory ? `${relativeDirectory}/${name}` : name;
@@ -63,7 +65,6 @@ export async function scanSourceTree(root, limits = DEFAULT_LIMITS) {
         if (size > limits.maxFileBytes) throw new Error(`Workspace source file exceeds ${limits.maxFileBytes} bytes: ${relativePath}`);
         totalBytes += size;
         if (totalBytes > limits.maxBytes) throw new Error(`Workspace source exceeds ${limits.maxBytes} bytes`);
-        if (statBefore.nlink > 1n) throw new Error(`Workspace source contains a hard link: ${relativePath}`);
         const content = await readFile(absolutePath);
         const statAfter = await lstat(absolutePath, { bigint: true });
         if (statBefore.size !== statAfter.size || statBefore.mtimeNs !== statAfter.mtimeNs || statBefore.ino !== statAfter.ino) throw new Error(`Workspace source changed while reading: ${relativePath}`);

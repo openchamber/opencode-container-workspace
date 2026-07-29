@@ -7,7 +7,7 @@ import { AUTH_HEADER, AUTH_SECRET_NAME } from './auth.js';
 import { readWorkspaceSecret, readWorkspaceState, withWorkspaceLock, writeWorkspaceState } from './state-store.js';
 
 const REGISTRY_KEY = Symbol.for('openchamber.secure-workspace-transport-shim.v1');
-const REGISTRY_VERSION = 1;
+const REGISTRY_VERSION = 2;
 const LISTEN_HOST = '127.0.0.1';
 const HEADER_TIMEOUT_MS = 10_000;
 const MAX_WEBSOCKET_HEADERS = 64 * 1024;
@@ -20,6 +20,7 @@ export async function ensureTransportShim(options) {
   const existing = registry.entries.get(identity.providerResourceID);
   if (existing) {
     assertSameIdentity(existing.identity, identity);
+    assertSameRuntimeDirectory(existing.runtimeDirectory, options.runtimeDirectory);
     existing.getTarget = options.getTarget;
     existing.targetPolicy = options.targetPolicy;
     await refreshTarget(existing);
@@ -30,6 +31,7 @@ export async function ensureTransportShim(options) {
   if (pending) {
     const entry = await pending;
     assertSameIdentity(entry.identity, identity);
+    assertSameRuntimeDirectory(entry.runtimeDirectory, options.runtimeDirectory);
     entry.getTarget = options.getTarget;
     entry.targetPolicy = options.targetPolicy;
     await refreshTarget(entry);
@@ -68,6 +70,7 @@ async function createTransportShim(registry, identity, options) {
     const raced = registry.entries.get(identity.providerResourceID);
     if (raced) {
       assertSameIdentity(raced.identity, identity);
+      assertSameRuntimeDirectory(raced.runtimeDirectory, options.runtimeDirectory);
       return raced;
     }
 
@@ -75,6 +78,7 @@ async function createTransportShim(registry, identity, options) {
     assertOwnedState(state, identity);
     const entry = {
       identity,
+      runtimeDirectory: normalizeRuntimeDirectory(options.runtimeDirectory),
       getTarget: options.getTarget,
       targetPolicy: options.targetPolicy,
       target: null,
@@ -146,7 +150,7 @@ async function proxyHttp(entry, request, response) {
     hostname: target.hostname,
     port: target.port,
     method: request.method,
-    path: request.url,
+    path: rewriteRequestTarget(request.url, entry.runtimeDirectory),
     headers,
   });
   upstream.once('socket', (socket) => socket.unref());
@@ -215,7 +219,7 @@ async function proxyWebSocket(entry, request, clientSocket, head) {
     headers.upgrade = 'websocket';
     headers.origin = target.origin;
     headers[AUTH_HEADER] = token;
-    upstream.write(`${request.method} ${request.url} HTTP/1.1\r\n${serializeHeaders(headers)}\r\n`);
+    upstream.write(`${request.method} ${rewriteRequestTarget(request.url, entry.runtimeDirectory)} HTTP/1.1\r\n${serializeHeaders(headers)}\r\n`);
     if (head.length > 0) upstream.write(head);
   });
   upstream.on('data', onHeaders);
@@ -346,6 +350,27 @@ function validRequestTarget(value) {
     && !value.startsWith('//')
     && !value.includes('#')
     && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function rewriteRequestTarget(value, runtimeDirectory) {
+  const url = new URL(value, 'http://workspace.invalid');
+  if (url.searchParams.has('directory')) url.searchParams.set('directory', runtimeDirectory);
+  return `${url.pathname}${url.search}`;
+}
+
+function normalizeRuntimeDirectory(value) {
+  if (typeof value !== 'string'
+    || !value.startsWith('/')
+    || value.length > 4096
+    || /[\u0000-\u001f\u007f?#]/.test(value)
+    || value.split('/').some((segment) => segment === '.' || segment === '..')) {
+    throw new Error('Workspace runtime directory is invalid');
+  }
+  return value;
+}
+
+function assertSameRuntimeDirectory(left, right) {
+  if (left !== normalizeRuntimeDirectory(right)) throw new Error('Workspace runtime directory reassignment was rejected');
 }
 
 function validRequestFraming(request) {

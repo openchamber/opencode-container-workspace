@@ -82,7 +82,7 @@ Apple Container live certification is environment-gated. Set `OPENCHAMBER_APPLE_
 - Cleanup is idempotent for absent resources and refuses foreign resources.
 - Mutable storage and an immutable runtime-read-only baseline are seeded from the same source archive, preserving dirty Git and non-Git source content.
 - Runtime endpoint authentication uses a random 256-bit file-backed token and constant-time comparison across HTTP, SSE, and WebSocket.
-- OpenCode receives a stable, unauthenticated loopback transport URL per workspace. A private host-process shim verifies the provider target, strips client credentials and routing headers, rereads the canonical workspace token for every new HTTP or WebSocket connection, and injects it only toward that workspace's fixed upstream.
+- OpenCode receives a stable, unauthenticated loopback transport URL per workspace. A private host-process shim verifies the provider target, strips client credentials and routing headers, rewrites caller directory routing to the provider-owned runtime directory, rereads the canonical workspace token for every new HTTP or WebSocket connection, and injects it only toward that workspace's fixed upstream.
 - The shim trusts processes running as the same OS user on the host. Containers, Kubernetes ingress/cluster peers, LAN peers, and remote clients remain outside that boundary; provider health and reconciliation continue to use the unchanged authenticated provider target directly.
 - Provider process output is bounded and sensitive values are redacted.
 - Snapshot traversal detects source mutation, rejects escaping symlinks/hard links/special files, and enforces entry, file, and total byte limits.

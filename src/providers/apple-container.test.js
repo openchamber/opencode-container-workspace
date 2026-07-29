@@ -8,7 +8,7 @@ vi.mock('../process.js', async (importOriginal) => ({ ...await importOriginal(),
 const { createWorkspaceSecrets, getWorkspaceToken } = await import('../auth.js');
 const { providerLabels } = await import('../metadata.js');
 const { readPolicy } = await import('../policy.js');
-const { writeWorkspaceState } = await import('../state-store.js');
+const { readWorkspaceState, writeWorkspaceState } = await import('../state-store.js');
 const { createAppleContainerProvider } = await import('./apple-container.js');
 
 describe('Apple Container provider contracts', () => {
@@ -37,6 +37,20 @@ describe('Apple Container provider contracts', () => {
 
   it('rejects unsupported secret modes and connected default networks', () => {
     expect(() => readPolicy({ secrets: { mode: 'environment' } })).toThrow(/provider-backed files/);
+  });
+
+  it('treats generic Apple delete failures as success after confirming absence', async () => {
+    const image = 'workspace-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const policy = readPolicy({ defaultImage: image, egress: { mode: 'external', proxyUrl: 'http://127.0.0.1:3128' } });
+    const provider = createAppleContainerProvider({ policy, sourceDirectory: '/source' });
+    const info = provider.configure({ id: 'control-id', projectID: 'project-id' });
+    const identity = { provider: 'apple-container', providerResourceID: info.extra.providerResourceID, projectID: 'project-id', controlPlaneWorkspaceID: 'control-id', originalControlPlaneWorkspaceID: 'control-id' };
+    await writeWorkspaceState(info.extra.providerResourceID, { version: 1, ...identity, lifecycle: 'failed' });
+    processMocks.runJson.mockRejectedValue(new Error('resource not found'));
+    processMocks.run.mockRejectedValue(new Error('failed to delete one or more resources'));
+
+    await expect(provider.remove(info)).resolves.toMatchObject({ ok: true, remainingResources: [] });
+    expect(await readWorkspaceState(info.extra.providerResourceID)).toBeNull();
   });
 
   it('restores credentials and recreates the runtime when a detached secret update fails', async () => {
