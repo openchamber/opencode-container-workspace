@@ -15,7 +15,7 @@ Provider secrets and arbitrary process helpers are intentionally not exported.
 ## Requirements
 
 - OpenCode with the compatible experimental workspace registry.
-- An explicitly configured digest-pinned runtime image containing OpenCode 1.18.4, Node.js, Git, tar, OpenSSH client, and a POSIX shell.
+- An explicitly configured digest-pinned runtime image containing OpenCode 1.18.8, Node.js, Git, tar, OpenSSH client, and a POSIX shell.
 - Docker CLI/daemon, `kubectl`, or Apple Container as appropriate.
 - A digest-pinned managed gateway image or an explicit external egress proxy. The package never silently permits direct runtime egress.
 - For Docker or Apple Container, `OPENCHAMBER_WORKSPACE_STATE_DIR` must be on a host path visible to the container runtime because source archives and file-backed secrets are staged there.
