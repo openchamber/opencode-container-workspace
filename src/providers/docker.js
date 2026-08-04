@@ -1,14 +1,15 @@
 import { createServer } from 'node:net';
 import { commandExists, run, runJson } from '../process.js';
 import { ProviderUnavailableError, OwnershipError } from '../errors.js';
-import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
+import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readCleanupMetadata, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
 import { createWorkspaceSecrets, getWorkspaceToken, rotateWorkspaceCredentials, selectGrantedCredentials } from '../auth.js';
 import { requireDockerEgress, validateImage } from '../policy.js';
+import { grantedEgressPolicy } from '../egress-domains.js';
 import { waitForHttpHealth } from '../health.js';
 import { PROVIDER_MODEL_AUTH_FILE, PROVIDER_SECRET_DIRECTORY, PROVIDER_TOKEN_FILE, runtimeCommand, runtimeEnvironment } from '../runtime-command.js';
 import { cleanupTransaction, createTransaction } from '../lifecycle.js';
 import { readWorkspaceState, stateRoot, writeWorkspaceState } from '../state-store.js';
-import { createSourceSnapshot } from '../snapshot.js';
+import { createSourceSnapshot, resolveSnapshotSource } from '../snapshot.js';
 import { ARTIFACT_LIMITS, RUNTIME_ARTIFACT_SCRIPT } from '../artifact.js';
 
 export function createDockerProvider({ policy, sourceDirectory }) {
@@ -16,8 +17,15 @@ export function createDockerProvider({ policy, sourceDirectory }) {
 
   async function preflight() {
     requireDockerEgress(policy);
-    if (!commandExists('docker')) throw new ProviderUnavailableError('Docker CLI is not available', { provider });
-    await run('docker', ['info'], { timeoutMs: 15_000 });
+    // `docker info` is the authoritative probe: a spawn failure means the CLI is
+    // missing, a non-zero exit means the daemon is unreachable. A separate
+    // commandExists pre-gate proved flaky under load and is intentionally absent.
+    try {
+      await run('docker', ['info'], { timeoutMs: 15_000 });
+    } catch (cause) {
+      if (cause?.kind === 'spawn') throw new ProviderUnavailableError('Docker CLI is not available', { provider, code: 'WORKSPACE_PROVIDER_CLI_MISSING', cause });
+      throw new ProviderUnavailableError('Docker daemon is not reachable', { provider, code: 'WORKSPACE_PROVIDER_DAEMON_UNAVAILABLE', cause });
+    }
     return { provider, available: true, diagnostics: [] };
   }
 
@@ -33,20 +41,23 @@ export function createDockerProvider({ policy, sourceDirectory }) {
     };
   }
 
-  async function create(info, env = {}) {
+  async function create(info, env = {}, _from, context) {
     await preflight();
     const meta = readMetadata(info, provider, policy);
     const identity = identityFromMetadata(meta);
     const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
     const image = validateImage(policy, meta.imageDigest);
+    const snapshotSource = resolveSnapshotSource(context, sourceDirectory);
     await run('docker', ['image', 'inspect', image], { timeoutMs: 20_000 }).catch(() => run('docker', ['pull', image], { timeoutMs: 300_000 }));
 
     await createTransaction(identity, async (transaction) => {
-      const sourceSnapshot = await createSourceSnapshot(sourceDirectory, { temporaryRoot: stateRoot() });
+      const sourceSnapshot = await createSourceSnapshot(snapshotSource, { temporaryRoot: stateRoot() });
       try {
       if (!transaction.recovering) await assertResourcesAbsent(refs);
       await transaction.bindSnapshot(sourceSnapshot.generation);
-      const secrets = await createWorkspaceSecrets(meta.providerResourceID, selectGrantedCredentials(policy, env));
+      const grantedCredentials = selectGrantedCredentials(policy, env);
+      const egress = grantedEgressPolicy(policy, grantedCredentials);
+      const secrets = await createWorkspaceSecrets(meta.providerResourceID, grantedCredentials);
       const hostPort = await availableStablePort(meta.providerResourceID);
       await transaction.update({ hostPort, imageDigest: image });
       await transaction.create(`network:${refs.network}`, async () => {
@@ -69,7 +80,7 @@ export function createDockerProvider({ policy, sourceDirectory }) {
         () => verifyDockerSeed(image, refs.baselineVolume, WORKSPACE_RUNTIME.baselineDirectory, sourceSnapshot.generation),
       );
       await updateSecretVolume(image, refs.secretVolume, secrets.token, secrets.modelAuth);
-      await transaction.create(`container:${refs.gateway}`, () => startEgressGateway({ runtimeImage: image, refs, identity, egress: policy.egress }), () => removeDocker('container', refs.gateway), () => dockerResourceExistsOwned('container', refs.gateway, providerLabels(identity, 'egress-gateway')));
+      await transaction.create(`container:${refs.gateway}`, () => startEgressGateway({ runtimeImage: image, refs, identity, egress }), () => removeDocker('container', refs.gateway), () => dockerResourceExistsOwned('container', refs.gateway, providerLabels(identity, 'egress-gateway')));
       await transaction.create(
         `network-attachment:${refs.gateway}:${refs.network}`,
         () => run('docker', ['network', 'connect', '--alias', 'workspace-egress', refs.network, refs.gateway], { timeoutMs: 60_000 }),
@@ -128,10 +139,10 @@ export function createDockerProvider({ policy, sourceDirectory }) {
   }
 
   async function remove(info) {
-    const meta = readMetadata(info, provider, policy);
-    const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
+    const { meta, diagnostics } = readCleanupMetadata(info, provider, policy);
+    const refs = meta.resourceRefs;
     const identity = identityFromMetadata(meta);
-    return cleanupTransaction(meta.providerResourceID, async (cleanup) => {
+    const result = await cleanupTransaction(meta.providerResourceID, async (cleanup) => {
       await verifyExistingResources(refs, identity);
       await cleanup.remove(`container:${refs.access}`, () => removeDocker('container', refs.access));
       await cleanup.remove(`container:${refs.runtime}`, () => removeDocker('container', refs.runtime));
@@ -146,10 +157,15 @@ export function createDockerProvider({ policy, sourceDirectory }) {
         cleanup.retain(`volume:${refs.baselineVolume}`);
       }
     });
+    return { ...result, diagnostics: [...diagnostics, ...(result.diagnostics ?? [])] };
   }
 
   async function list(context) {
-    if (!commandExists('docker')) throw new ProviderUnavailableError('Docker CLI is not available', { provider });
+    // Absent tooling means this provider is not set up on this host, so an empty
+    // discovery result is authoritative rather than a hidden failure. Tooling that is
+    // present but failing (daemon down, broken cluster) still raises, so a real
+    // provider failure never degrades into silence.
+    if (!commandExists('docker')) return [];
     const projectID = context?.instance?.project?.id;
     if (!projectID) throw new Error('Docker workspace discovery requires an authoritative project ID');
     const filters = ['--filter', 'label=openchamber.managed=true', '--filter', 'label=openchamber.workspace.provider=docker', '--filter', 'label=openchamber.resource.role=runtime', '--filter', `label=openchamber.project.id=${labelHash(projectID)}`];

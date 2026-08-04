@@ -8,6 +8,23 @@ import { run } from './process.js';
 const DEFAULT_LIMITS = Object.freeze({ maxEntries: 100_000, maxBytes: 2 * 1024 ** 3, maxFileBytes: 256 * 1024 ** 2 });
 const RESERVED_ROOTS = new Set(['.openchamber', '.openchamber-runtime']);
 const EXCLUDED_ROOTS = new Set(['.git']);
+const WORKSPACE_RUNTIME_DIRECTORY = '/workspace';
+
+// OpenCode registers adapters per project ID, and every non-Git directory shares the
+// global project ID, so the plugin instance whose closure captured `sourceDirectory`
+// may belong to a different instance than the one handling the create request — on a
+// relaunch that can even be the workspace runtime projection (`/workspace`). The create
+// context always carries the correct originating instance, so prefer its directory and
+// refuse the runtime projection outright instead of snapshotting the wrong tree.
+export function resolveSnapshotSource(context, fallbackDirectory) {
+  const contextDirectory = typeof context?.instance?.directory === 'string' ? context.instance.directory.trim() : '';
+  const candidate = contextDirectory || (typeof fallbackDirectory === 'string' ? fallbackDirectory.trim() : '');
+  if (!candidate) throw new Error('Workspace source directory is required to create a snapshot');
+  if (resolve(candidate) === resolve(WORKSPACE_RUNTIME_DIRECTORY)) {
+    throw new Error('Workspace source directory resolves to the workspace runtime path; refusing to snapshot');
+  }
+  return candidate;
+}
 
 export async function createSourceSnapshot(sourceDirectory, options = {}) {
   const root = await realpath(sourceDirectory);

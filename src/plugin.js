@@ -2,7 +2,7 @@ import { createDockerProvider } from './providers/docker.js';
 import { createKubernetesProvider } from './providers/kubernetes.js';
 import { createAppleContainerProvider } from './providers/apple-container.js';
 import { readPolicy } from './policy.js';
-import { readMetadata } from './metadata.js';
+import { readCleanupMetadata, readMetadata } from './metadata.js';
 import { closeTransportShim, ensureTransportShim } from './transport-shim.js';
 
 export default async function openchamberWorkspacePlugin(input, options = {}) {
@@ -52,7 +52,7 @@ export default async function openchamberWorkspacePlugin(input, options = {}) {
         }
       },
       async remove(info, context) {
-        const providerResourceID = readMetadata(info, provider.kind, policy).providerResourceID;
+        const providerResourceID = readCleanupMetadata(info, provider.kind, policy).meta.providerResourceID;
         try {
           await provider.remove(info, context);
         } finally {

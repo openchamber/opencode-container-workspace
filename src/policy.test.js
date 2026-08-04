@@ -63,8 +63,17 @@ describe('workspace policy', () => {
 
   it('loads the restricted domain set from the packaged versioned preset', () => {
     const policy = readPolicy({ egress: { mode: 'managed', gatewayImage: 'gateway@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' } });
+    // The preset must cover what a workspace cannot function without: the model
+    // catalog, the shipped provider endpoints, git hosts, and package registries.
     expect(policy.egress.gatewayPolicy.allowedDomains).toEqual([
-      'api.anthropic.com', 'api.openai.com', 'api.github.com', 'github.com', '*.githubusercontent.com', 'registry.npmjs.org',
+      'models.dev', 'opencode.ai', 'api.opencode.ai',
+      'api.anthropic.com', 'api.openai.com',
+      'api.github.com', 'github.com', 'codeload.github.com', '*.githubusercontent.com',
+      'registry.npmjs.org', 'registry.yarnpkg.com',
+      'pypi.org', 'files.pythonhosted.org',
+      'crates.io', 'index.crates.io', 'static.crates.io',
+      'proxy.golang.org', 'sum.golang.org',
+      'repo.maven.apache.org', 'rubygems.org', 'repo.packagist.org',
     ]);
   });
 

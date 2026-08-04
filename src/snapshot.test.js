@@ -2,8 +2,28 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { chmod, link, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createSourceSnapshot, scanSourceTree } from './snapshot.js';
+import { createSourceSnapshot, resolveSnapshotSource, scanSourceTree } from './snapshot.js';
 import { run } from './process.js';
+
+describe('snapshot source resolution', () => {
+  it('prefers the create context instance directory over the plugin closure directory', () => {
+    expect(resolveSnapshotSource({ instance: { directory: '/host/project' } }, '/other/project')).toBe('/host/project');
+  });
+
+  it('falls back to the plugin closure directory without a create context', () => {
+    expect(resolveSnapshotSource(undefined, '/host/project')).toBe('/host/project');
+    expect(resolveSnapshotSource({ instance: {} }, '/host/project')).toBe('/host/project');
+  });
+
+  it('requires some source directory', () => {
+    expect(() => resolveSnapshotSource(undefined, '')).toThrow(/source directory is required/);
+  });
+
+  it('refuses to snapshot the workspace runtime projection', () => {
+    expect(() => resolveSnapshotSource({ instance: { directory: '/workspace' } }, '/host/project')).toThrow(/runtime path/);
+    expect(() => resolveSnapshotSource(undefined, '/workspace')).toThrow(/runtime path/);
+  });
+});
 
 describe('safe source snapshots', () => {
   const roots = [];

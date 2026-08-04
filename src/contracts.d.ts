@@ -59,6 +59,7 @@ export interface ProviderDiscoveryResult {
 export interface CleanupResult {
   ok: boolean;
   remainingResources: string[];
+  retainedResources?: string[];
   diagnostics: string[];
 }
 

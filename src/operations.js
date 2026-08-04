@@ -68,6 +68,26 @@ export function createWorkspaceProviderOperations(options = {}) {
     });
   }
 
+  // Cleanup-safe adoption: verifies immutable identity against persisted state but does
+  // not require a healthy reconcile. A degraded or policy-mismatched workspace must stay
+  // deletable; per-resource ownership labels are verified inside provider remove().
+  async function adoptWorkspaceForCleanup(workspace) {
+    parseWorkspaceRecord(workspace);
+    providerForWorkspace(workspace);
+    const metadata = parseWorkspaceMetadata(workspace.extra);
+    if (metadata.projectID !== workspace.projectID) throw new Error('Workspace project identity does not match recovery metadata');
+    if (metadata.controlPlaneWorkspaceID === workspace.id) return workspace;
+    const originalControlPlaneWorkspaceID = metadata.originalControlPlaneWorkspaceID ?? metadata.controlPlaneWorkspaceID;
+    const state = await readWorkspaceState(metadata.providerResourceID);
+    if (!state || state.providerResourceID !== metadata.providerResourceID || state.provider !== metadata.provider || state.projectID !== metadata.projectID) {
+      throw new Error('Workspace recovery state identity mismatch');
+    }
+    if (state.controlPlaneWorkspaceID !== workspace.id && state.controlPlaneWorkspaceID !== metadata.controlPlaneWorkspaceID) {
+      throw new Error('Workspace recovery control-plane identity mismatch');
+    }
+    return { ...workspace, extra: Object.freeze({ ...metadata, controlPlaneWorkspaceID: workspace.id, originalControlPlaneWorkspaceID }) };
+  }
+
   return Object.freeze({
     async validateProvider(kind) {
       return providers.get(parseProviderKind(kind)).validate();
@@ -95,7 +115,7 @@ export function createWorkspaceProviderOperations(options = {}) {
       return { provider: provider.kind, providerResourceID: metadata.providerResourceID, health, diagnostics: [] };
     },
     async cleanupWorkspace(workspace) {
-      workspace = await adoptWorkspace(workspace);
+      workspace = await adoptWorkspaceForCleanup(workspace);
       return providerForWorkspace(workspace).remove(workspace);
     },
     async reconcileWorkspace(workspace) {

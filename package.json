@@ -23,7 +23,7 @@
     }
   },
   "scripts": {
-    "build": "node --check src/plugin.js && node --check src/transport-shim.js && node --check src/contracts.js && node --check src/operations.js && node --check src/artifact.js && node --check src/snapshot.js && node --check src/egress-gateway.js && node --check src/label-id.js && node --check src/process.js && node --check src/state-store.js && node --check src/lifecycle.js && node --check src/metadata.js && node --check src/runtime-command.js && node --check src/providers/docker.js && node --check src/providers/kubernetes.js && node --check src/providers/apple-container.js",
+    "build": "node --check src/plugin.js && node --check src/transport-shim.js && node --check src/contracts.js && node --check src/operations.js && node --check src/artifact.js && node --check src/snapshot.js && node --check src/egress-gateway.js && node --check src/egress-domains.js && node --check src/label-id.js && node --check src/process.js && node --check src/state-store.js && node --check src/lifecycle.js && node --check src/metadata.js && node --check src/runtime-command.js && node --check src/providers/docker.js && node --check src/providers/kubernetes.js && node --check src/providers/apple-container.js",
     "type-check": "tsc --noEmit",
     "lint": "bun run build",
     "test": "vitest run"

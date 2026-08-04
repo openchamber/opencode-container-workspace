@@ -2,12 +2,27 @@
   "version": 1,
   "sets": {
     "restricted": [
+      "models.dev",
+      "opencode.ai",
+      "api.opencode.ai",
       "api.anthropic.com",
       "api.openai.com",
       "api.github.com",
       "github.com",
+      "codeload.github.com",
       "*.githubusercontent.com",
-      "registry.npmjs.org"
+      "registry.npmjs.org",
+      "registry.yarnpkg.com",
+      "pypi.org",
+      "files.pythonhosted.org",
+      "crates.io",
+      "index.crates.io",
+      "static.crates.io",
+      "proxy.golang.org",
+      "sum.golang.org",
+      "repo.maven.apache.org",
+      "rubygems.org",
+      "repo.packagist.org"
     ]
   }
 }
