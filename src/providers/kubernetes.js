@@ -7,7 +7,7 @@ import { commandExists, run, runJson, spawnBackground } from '../process.js';
 import { CleanupError, OwnershipError, ProviderUnavailableError } from '../errors.js';
 import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readCleanupMetadata, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
 import { createWorkspaceSecrets, getWorkspaceToken, rotateWorkspaceCredentials, selectGrantedCredentials } from '../auth.js';
-import { requireKubernetesEgress, validateImage } from '../policy.js';
+import { requireKubernetesEgress, validateGatewayImage, validateImage } from '../policy.js';
 import { grantedEgressPolicy } from '../egress-domains.js';
 import { waitForHttpHealth } from '../health.js';
 import { KUBERNETES_TOKEN_FILE, KUBERNETES_TOKEN_MOUNT_PATH, PROVIDER_MODEL_AUTH_FILE, runtimeCommand, runtimeEnvironment } from '../runtime-command.js';
@@ -81,6 +81,17 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
     return { provider, available: true, diagnostics: enforcement?.diagnostics ?? [], isolation: enforcement ? { verdict: enforcement.verdict } : null };
   }
 
+/**
+   * The image the isolation probe runs. The probe only needs a runtime that can open a
+   * TCP connection, so it uses the egress gateway image where managed egress already
+   * requires it: a quarter the size of the workspace image, which matters because a
+   * cluster seeing either for the first time must download it before answering.
+   */
+  function isolationProbeImage() {
+    if (policy.egress.mode === 'managed' && policy.egress.gatewayImage) return validateGatewayImage(policy.egress.gatewayImage);
+    return validateImage(policy, policy.defaultImage);
+  }
+
   /**
    * The address of the cluster's DNS service, which is different on every cluster and is
    * therefore discovered rather than asked for. The setting remains an override, and is
@@ -148,7 +159,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
       return { action, namespace, created: !exists };
     }
     if (action === 'check-isolation') {
-      const result = await checkNetworkPolicyEnforcement(kubectl, { context: policy.kubernetes.context, namespace: policy.kubernetes.namespace, image: validateImage(policy, policy.defaultImage), force: true });
+      const result = await checkNetworkPolicyEnforcement(kubectl, { context: policy.kubernetes.context, namespace: policy.kubernetes.namespace, image: isolationProbeImage(), force: true });
       return { action, verdict: result.verdict, diagnostics: result.diagnostics, imageUnavailable: result.imageUnavailable === true };
     }
     throw new Error(`Unsupported Kubernetes setup action: ${action}`);
@@ -166,7 +177,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
     // Every isolation guarantee this provider makes rests on the cluster enforcing the
     // NetworkPolicies it writes, and acceptance of the objects proves nothing. Verified
     // here rather than in preflight so listing and readiness stay cheap.
-    const enforcement = await requireNetworkPolicyEnforcement(kubectl, { provider, context: policy.kubernetes.context, namespace: policy.kubernetes.namespace, image: validateImage(policy, policy.defaultImage) });
+    const enforcement = await requireNetworkPolicyEnforcement(kubectl, { provider, context: policy.kubernetes.context, namespace: policy.kubernetes.namespace, image: isolationProbeImage() });
     const meta = readMetadata(info, provider, policy);
     const identity = identityFromMetadata(meta);
     const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
