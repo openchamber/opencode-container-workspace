@@ -122,7 +122,12 @@ async function runProbePod(kubectl, manifest, namespace, deadline, now) {
     const waiting = container?.state?.waiting;
     // An unpullable image never terminates, so treat it as a probe failure rather than
     // waiting out the whole deadline for a pod that cannot run.
-    if (waiting && /ErrImagePull|ImagePullBackOff|InvalidImageName|CreateContainerConfigError/i.test(waiting.reason ?? '')) {
+    if (waiting && /ErrImagePull|ImagePullBackOff|InvalidImageName/i.test(waiting.reason ?? '')) {
+      // Distinguished from other start failures because the cause is a setting the
+      // operator owns, not anything about the cluster's networking.
+      return { blocked: `the workspace image could not be pulled by the cluster`, imageUnavailable: true };
+    }
+    if (waiting && /CreateContainerConfigError/i.test(waiting.reason ?? '')) {
       return { blocked: `probe pod ${name} cannot start: ${waiting.reason}${waiting.message ? ` (${waiting.message})` : ''}` };
     }
     if (status.phase === 'Failed' && !terminated) return { blocked: `probe pod ${name} failed: ${status.reason ?? 'unknown reason'}` };
@@ -144,7 +149,7 @@ export async function probeNetworkPolicyEnforcement(kubectl, { namespace, image,
   try {
     const baseline = await runProbePod(kubectl, probePod(`${baseName}-baseline`, namespace, { ...labels, 'openchamber.io/probe-role': 'baseline' }, image, 'baseline'), namespace, deadline, now);
     created.push(['pod', `${baseName}-baseline`]);
-    if (baseline.blocked) return { verdict: ENFORCEMENT_VERDICTS.INCONCLUSIVE, diagnostics: [`Network isolation could not be verified: ${baseline.blocked}.`] };
+    if (baseline.blocked) return { verdict: ENFORCEMENT_VERDICTS.INCONCLUSIVE, diagnostics: [`Network isolation could not be verified: ${baseline.blocked}.`], imageUnavailable: baseline.imageUnavailable === true };
     if (baseline.exitCode !== 0) {
       return {
         verdict: ENFORCEMENT_VERDICTS.INCONCLUSIVE,
@@ -156,7 +161,7 @@ export async function probeNetworkPolicyEnforcement(kubectl, { namespace, image,
     created.push(['networkpolicy', baseName]);
     const restricted = await runProbePod(kubectl, probePod(`${baseName}-restricted`, namespace, restrictedLabels, image, 'restricted'), namespace, deadline, now);
     created.push(['pod', `${baseName}-restricted`]);
-    if (restricted.blocked) return { verdict: ENFORCEMENT_VERDICTS.INCONCLUSIVE, diagnostics: [`Network isolation could not be verified: ${restricted.blocked}.`] };
+    if (restricted.blocked) return { verdict: ENFORCEMENT_VERDICTS.INCONCLUSIVE, diagnostics: [`Network isolation could not be verified: ${restricted.blocked}.`], imageUnavailable: restricted.imageUnavailable === true };
     if (restricted.exitCode === 0) return { verdict: ENFORCEMENT_VERDICTS.NOT_ENFORCED, diagnostics: [] };
     return { verdict: ENFORCEMENT_VERDICTS.ENFORCED, diagnostics: [] };
   } finally {

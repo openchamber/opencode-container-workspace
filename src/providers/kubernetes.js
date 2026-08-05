@@ -47,9 +47,19 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
       }
       throw new ProviderUnavailableError(`Kubernetes cluster is not reachable: ${cause instanceof Error ? cause.message : String(cause)}`, { provider, code: 'WORKSPACE_PROVIDER_CLUSTER_UNREACHABLE', cause });
     });
-    for (const [verb, resource] of requiredPermissions(policy)) {
+    // Each check is a process spawn and a round trip, and there are two dozen of them:
+    // run sequentially they dominated the time to display readiness. Every denial is
+    // collected rather than only the first, so one message names everything to request.
+    const denied = await mapWithConcurrency(requiredPermissions(policy), RBAC_PROBE_CONCURRENCY, async ([verb, resource]) => {
       const { stdout } = await kubectl(['auth', 'can-i', verb, resource, '-n', policy.kubernetes.namespace], { timeoutMs: 20_000 });
-      if (stdout.trim() !== 'yes') throw new ProviderUnavailableError(`Kubernetes RBAC denies ${verb} ${resource} in namespace ${policy.kubernetes.namespace}`, { provider, code: 'WORKSPACE_PROVIDER_RBAC_DENIED' });
+      return stdout.trim() === 'yes' ? null : `${verb} ${resource}`;
+    });
+    const missing = denied.filter(Boolean);
+    if (missing.length > 0) {
+      throw new ProviderUnavailableError(
+        `Kubernetes RBAC denies ${missing.join(', ')} in namespace ${policy.kubernetes.namespace}`,
+        { provider, code: 'WORKSPACE_PROVIDER_RBAC_DENIED' },
+      );
     }
     // Validated after the environment checks because the DNS address is discovered from
     // the cluster, and an unreachable cluster is a more actionable answer than a policy gap.
@@ -139,7 +149,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
     }
     if (action === 'check-isolation') {
       const result = await checkNetworkPolicyEnforcement(kubectl, { context: policy.kubernetes.context, namespace: policy.kubernetes.namespace, image: validateImage(policy, policy.defaultImage), force: true });
-      return { action, verdict: result.verdict, diagnostics: result.diagnostics };
+      return { action, verdict: result.verdict, diagnostics: result.diagnostics, imageUnavailable: result.imageUnavailable === true };
     }
     throw new Error(`Unsupported Kubernetes setup action: ${action}`);
   }
@@ -591,6 +601,23 @@ async function availableStablePort(providerResourceID) {
 
 function portAvailable(port) {
   return new Promise((resolve) => { const server = createServer(); server.once('error', () => resolve(false)); server.listen(port, '127.0.0.1', () => server.close(() => resolve(true))); });
+}
+
+const RBAC_PROBE_CONCURRENCY = 8;
+
+/** Runs `task` over `items` with a bounded number in flight, preserving input order. */
+async function mapWithConcurrency(items, limit, task) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await task(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 function requiredPermissions(policy) {
