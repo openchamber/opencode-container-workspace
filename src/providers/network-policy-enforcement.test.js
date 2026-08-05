@@ -69,7 +69,10 @@ describe('kubernetes network policy enforcement probe', () => {
     const result = await probeNetworkPolicyEnforcement(kubectl, { namespace: 'workspaces', image: IMAGE });
 
     expect(result.verdict).toBe(ENFORCEMENT_VERDICTS.INCONCLUSIVE);
-    expect(result.diagnostics[0]).toMatch(/ImagePullBackOff/);
+    // The cause is a setting the operator owns, so it is reported apart from anything
+    // the probe learned about the cluster's networking.
+    expect(result.imageUnavailable).toBe(true);
+    expect(result.diagnostics[0]).toMatch(/image could not be pulled/i);
   });
 
   it('removes every probe resource it created, including after a verdict of no enforcement', async () => {

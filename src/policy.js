@@ -196,7 +196,7 @@ export function validateImage(policy, image) {
   return normalized;
 }
 
-function validateGatewayImage(image) {
+export function validateGatewayImage(image) {
   const normalized = String(image ?? '').trim();
   if (!isPinnedImage(normalized)) throw new PolicyError('Managed egress requires a sha256 digest-pinned gateway image');
   return normalized;
