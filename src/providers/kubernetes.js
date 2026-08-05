@@ -15,6 +15,7 @@ import { cleanupTransaction, createTransaction } from '../lifecycle.js';
 import { readWorkspaceState, writeWorkspaceState } from '../state-store.js';
 import { createSourceSnapshot, resolveSnapshotSource } from '../snapshot.js';
 import { ARTIFACT_LIMITS, RUNTIME_ARTIFACT_SCRIPT } from '../artifact.js';
+import { checkNetworkPolicyEnforcement, lastEnforcementVerdict, requireNetworkPolicyEnforcement } from './network-policy-enforcement.js';
 
 const portForwards = new Map();
 
@@ -40,7 +41,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
     });
     for (const [verb, resource] of requiredPermissions(policy)) {
       const { stdout } = await kubectl(['auth', 'can-i', verb, resource, '-n', policy.kubernetes.namespace], { timeoutMs: 20_000 });
-      if (stdout.trim() !== 'yes') throw new ProviderUnavailableError(`Kubernetes RBAC denies ${verb} ${resource} in namespace ${policy.kubernetes.namespace}`, { provider });
+      if (stdout.trim() !== 'yes') throw new ProviderUnavailableError(`Kubernetes RBAC denies ${verb} ${resource} in namespace ${policy.kubernetes.namespace}`, { provider, code: 'WORKSPACE_PROVIDER_RBAC_DENIED' });
     }
     if (policy.kubernetes.connectivity === 'ingress') {
       await kubectl(['get', 'ingressclass', policy.kubernetes.ingress.ingressClassName, '-o', 'name'], { timeoutMs: 20_000 });
@@ -48,12 +49,34 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
       const namespaceSelector = selectorString(policy.kubernetes.ingress.controllerNamespaceSelector);
       const podSelector = selectorString(policy.kubernetes.ingress.controllerPodSelector);
       const namespaces = JSON.parse((await kubectl(['get', 'namespaces', '-l', namespaceSelector, '-o', 'json'], { timeoutMs: 30_000 })).stdout).items ?? [];
-      if (namespaces.length === 0) throw new ProviderUnavailableError('Kubernetes ingress controller namespace selector matches no namespaces', { provider });
+      if (namespaces.length === 0) throw new ProviderUnavailableError('Kubernetes ingress controller namespace selector matches no namespaces', { provider, code: 'WORKSPACE_PROVIDER_INGRESS_CONTROLLER_MISSING' });
       const namespaceNames = new Set(namespaces.map((item) => item.metadata?.name));
       const pods = JSON.parse((await kubectl(['get', 'pods', '--all-namespaces', '-l', podSelector, '-o', 'json'], { timeoutMs: 30_000 })).stdout).items ?? [];
-      if (!pods.some((item) => namespaceNames.has(item.metadata?.namespace))) throw new ProviderUnavailableError('Kubernetes ingress controller selectors match no pods', { provider });
+      if (!pods.some((item) => namespaceNames.has(item.metadata?.namespace))) throw new ProviderUnavailableError('Kubernetes ingress controller selectors match no pods', { provider, code: 'WORKSPACE_PROVIDER_INGRESS_CONTROLLER_MISSING' });
     }
-    return { provider, available: true, diagnostics: [] };
+    // Carries forward what an earlier create proved about this namespace; the probe
+    // itself is too slow to run on a readiness check.
+    const enforcement = lastEnforcementVerdict(policy.kubernetes.context, policy.kubernetes.namespace);
+    return { provider, available: true, diagnostics: enforcement?.diagnostics ?? [], isolation: enforcement ? { verdict: enforcement.verdict } : null };
+  }
+
+  /**
+   * Completes a setup requirement on the operator's behalf. Kept separate from preflight
+   * so that inspecting readiness never changes the cluster.
+   */
+  async function setup(action) {
+    if (action === 'create-namespace') {
+      if (!kubernetesConfigured(policy)) throw new ProviderUnavailableError('No Kubernetes configuration was found for this host', { provider, code: 'WORKSPACE_PROVIDER_NOT_CONFIGURED' });
+      const namespace = policy.kubernetes.namespace;
+      const exists = await kubectl(['get', 'namespace', namespace, '-o', 'name'], { timeoutMs: 20_000 }).then(() => true).catch(() => false);
+      if (!exists) await kubectl(['create', 'namespace', namespace], { timeoutMs: 30_000 });
+      return { action, namespace, created: !exists };
+    }
+    if (action === 'check-isolation') {
+      const result = await checkNetworkPolicyEnforcement(kubectl, { context: policy.kubernetes.context, namespace: policy.kubernetes.namespace, image: validateImage(policy, policy.defaultImage), force: true });
+      return { action, verdict: result.verdict, diagnostics: result.diagnostics };
+    }
+    throw new Error(`Unsupported Kubernetes setup action: ${action}`);
   }
 
   function configure(info) {
@@ -65,6 +88,10 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
 
   async function create(info, env = {}, _from, context) {
     await preflight();
+    // Every isolation guarantee this provider makes rests on the cluster enforcing the
+    // NetworkPolicies it writes, and acceptance of the objects proves nothing. Verified
+    // here rather than in preflight so listing and readiness stay cheap.
+    const enforcement = await requireNetworkPolicyEnforcement(kubectl, { provider, context: policy.kubernetes.context, namespace: policy.kubernetes.namespace, image: validateImage(policy, policy.defaultImage) });
     const meta = readMetadata(info, provider, policy);
     const identity = identityFromMetadata(meta);
     const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
@@ -215,7 +242,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
     });
   }
 
-  return { kind: provider, configure, create, target, remove, list, health, exportWorkspace, reconcile, rotateCredentials, validate: preflight };
+  return { kind: provider, configure, create, target, remove, list, health, exportWorkspace, reconcile, rotateCredentials, validate: preflight, setup };
 }
 
 export function buildManifests({ identity, refs, image, policy, token, modelAuth }) {
