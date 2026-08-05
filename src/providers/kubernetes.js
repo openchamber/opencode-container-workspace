@@ -18,6 +18,15 @@ import { ARTIFACT_LIMITS, RUNTIME_ARTIFACT_SCRIPT } from '../artifact.js';
 import { checkNetworkPolicyEnforcement, lastEnforcementVerdict, requireNetworkPolicyEnforcement } from './network-policy-enforcement.js';
 
 const portForwards = new Map();
+// Cluster DNS is a property of the cluster, so it is cached per kubeconfig context, and
+// expires so a cluster that is rebuilt under the same context name is not answered from
+// a stale entry for the lifetime of the process.
+const DNS_CACHE_TTL_MS = 10 * 60 * 1000;
+const dnsCIDRCache = new Map();
+
+export function resetKubernetesDiscoveryCache() {
+  dnsCIDRCache.clear();
+}
 
 export const KUBERNETES_SEED_EXTRACT_COMMAND = `set -eu; cat > /tmp/source.tar; tar --no-same-owner --no-overwrite-dir --strip-components=1 -xf /tmp/source.tar -C "$1"; mkdir -p "$1/.openchamber-runtime"; printf '%s' "$2" > "$1/.openchamber-runtime/source-generation"`;
 
@@ -31,7 +40,6 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
     // gap first hides the real reason this host cannot run Kubernetes workspaces.
     await kubectl(['version', '--client=true'], { timeoutMs: 15_000 }).catch((cause) => { throw new ProviderUnavailableError('kubectl is not available', { provider, code: 'WORKSPACE_PROVIDER_CLI_MISSING', cause }); });
     if (!kubernetesConfigured(policy)) throw new ProviderUnavailableError('No Kubernetes configuration was found for this host', { provider, code: 'WORKSPACE_PROVIDER_NOT_CONFIGURED' });
-    requireKubernetesEgress(policy);
     await kubectl(['get', 'namespace', policy.kubernetes.namespace, '-o', 'name'], { timeoutMs: 20_000 }).catch((cause) => {
       const text = `${cause?.stderr ?? ''} ${cause instanceof Error ? cause.message : String(cause)}`;
       if (/NotFound|not found/i.test(text)) {
@@ -43,6 +51,9 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
       const { stdout } = await kubectl(['auth', 'can-i', verb, resource, '-n', policy.kubernetes.namespace], { timeoutMs: 20_000 });
       if (stdout.trim() !== 'yes') throw new ProviderUnavailableError(`Kubernetes RBAC denies ${verb} ${resource} in namespace ${policy.kubernetes.namespace}`, { provider, code: 'WORKSPACE_PROVIDER_RBAC_DENIED' });
     }
+    // Validated after the environment checks because the DNS address is discovered from
+    // the cluster, and an unreachable cluster is a more actionable answer than a policy gap.
+    requireKubernetesEgress(policy, await resolveDnsCIDRs());
     if (policy.kubernetes.connectivity === 'ingress') {
       await kubectl(['get', 'ingressclass', policy.kubernetes.ingress.ingressClassName, '-o', 'name'], { timeoutMs: 20_000 });
       if (policy.kubernetes.ingress.tls.mode === 'existing-secret') await kubectl(['get', 'secret', policy.kubernetes.ingress.tls.secretName, '-n', policy.kubernetes.namespace, '-o', 'name'], { timeoutMs: 20_000 });
@@ -58,6 +69,60 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
     // itself is too slow to run on a readiness check.
     const enforcement = lastEnforcementVerdict(policy.kubernetes.context, policy.kubernetes.namespace);
     return { provider, available: true, diagnostics: enforcement?.diagnostics ?? [], isolation: enforcement ? { verdict: enforcement.verdict } : null };
+  }
+
+  /**
+   * The address of the cluster's DNS service, which is different on every cluster and is
+   * therefore discovered rather than asked for. The setting remains an override, and is
+   * the only route left when RBAC hides `kube-system` from this account.
+   */
+  async function resolveDnsCIDRs() {
+    if (policy.egress.dnsCIDRs.length > 0) return policy.egress.dnsCIDRs;
+    const cached = dnsCIDRCache.get(policy.kubernetes.context ?? '');
+    if (cached && cached.expiresAt > Date.now()) return cached.cidrs;
+    let discovered = [];
+    try {
+      const { stdout } = await kubectl(['get', 'service', '-n', 'kube-system', '-l', 'k8s-app=kube-dns', '-o', 'json'], { timeoutMs: 20_000 });
+      const services = JSON.parse(stdout).items ?? [];
+      const addresses = services.flatMap((item) => item?.spec?.clusterIPs ?? (item?.spec?.clusterIP ? [item.spec.clusterIP] : []));
+      discovered = addresses.filter((address) => typeof address === 'string' && address && address !== 'None')
+        .map((address) => (address.includes(':') ? `${address}/128` : `${address}/32`));
+    } catch {
+      discovered = [];
+    }
+    if (discovered.length === 0) {
+      throw new ProviderUnavailableError(
+        'The cluster DNS address could not be determined, and no DNS range is configured. Ask your cluster administrator for the DNS service address and set it under Advanced.',
+        { provider, code: 'WORKSPACE_PROVIDER_DNS_UNRESOLVED' },
+      );
+    }
+    dnsCIDRCache.set(policy.kubernetes.context ?? '', { cidrs: discovered, expiresAt: Date.now() + DNS_CACHE_TTL_MS });
+    return discovered;
+  }
+
+  /**
+   * What the host already knows about reaching a cluster. kubeconfig is where the
+   * industry keeps this, and it binds cluster and namespace together, so it is read
+   * rather than retyped. Only names travel: a kubeconfig also holds tokens, client
+   * certificates and server addresses, and none of that belongs in a settings surface.
+   */
+  async function describe() {
+    if (!kubernetesConfigured(policy)) return { provider, contexts: [], currentContext: null };
+    try {
+      const { stdout } = await run('kubectl', ['config', 'view', '-o', 'json'], { timeoutMs: 20_000 });
+      const config = JSON.parse(stdout);
+      const currentContext = typeof config['current-context'] === 'string' ? config['current-context'] : null;
+      const contexts = (Array.isArray(config.contexts) ? config.contexts : [])
+        .filter((entry) => typeof entry?.name === 'string' && entry.name)
+        .map((entry) => ({
+          name: entry.name,
+          namespace: typeof entry.context?.namespace === 'string' ? entry.context.namespace : null,
+          current: entry.name === currentContext,
+        }));
+      return { provider, contexts, currentContext };
+    } catch {
+      return { provider, contexts: [], currentContext: null };
+    }
   }
 
   /**
@@ -106,7 +171,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
       const secrets = await createWorkspaceSecrets(meta.providerResourceID, grantedCredentials);
       const hostPort = await availableStablePort(meta.providerResourceID);
       await transaction.update({ hostPort, imageDigest: image });
-      const manifests = buildManifests({ identity, refs, image, policy: { ...policy, egress: grantedEgressPolicy(policy, grantedCredentials) }, token: secrets.token, modelAuth: secrets.modelAuth });
+      const manifests = buildManifests({ identity, refs, image, policy: { ...policy, egress: { ...grantedEgressPolicy(policy, grantedCredentials), dnsCIDRs: await resolveDnsCIDRs() } }, token: secrets.token, modelAuth: secrets.modelAuth });
       for (const manifest of manifests.infrastructure) {
         const resource = `${manifest.kind.toLowerCase()}:${manifest.metadata.name}`;
         await transaction.create(resource, () => createManifest(kubectl, manifest), async () => {
@@ -242,7 +307,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
     });
   }
 
-  return { kind: provider, configure, create, target, remove, list, health, exportWorkspace, reconcile, rotateCredentials, validate: preflight, setup };
+  return { kind: provider, configure, create, target, remove, list, health, exportWorkspace, reconcile, rotateCredentials, validate: preflight, setup, describe };
 }
 
 export function buildManifests({ identity, refs, image, policy, token, modelAuth }) {
