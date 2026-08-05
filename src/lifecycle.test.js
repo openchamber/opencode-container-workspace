@@ -118,7 +118,7 @@ describe('workspace create transaction', () => {
       cleanup.retain('volume:mutable');
       cleanup.retain('volume:baseline');
     });
-    expect(result).toMatchObject({ ok: false, remainingResources: ['volume:mutable', 'volume:baseline'], retainedResources: ['volume:mutable', 'volume:baseline'] });
+    expect(result).toMatchObject({ ok: true, remainingResources: [], retainedResources: ['volume:mutable', 'volume:baseline'], diagnostics: ['Workspace storage was retained by policy'] });
     expect(await readWorkspaceState(identity.providerResourceID)).toMatchObject({ lifecycle: 'retained', retainedResources: ['volume:mutable', 'volume:baseline'] });
   });
 

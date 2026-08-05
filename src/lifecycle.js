@@ -165,7 +165,9 @@ export async function cleanupTransaction(providerResourceID, cleanup) {
     }
     if (retainedResources.length > 0) {
       await writeWorkspaceState(providerResourceID, { ...(state ?? { version: 1, providerResourceID }), lifecycle: 'retained', remainingResources: retainedResources, retainedResources, retainedAt: new Date().toISOString() });
-      return { ok: false, remainingResources: retainedResources, retainedResources, diagnostics: ['Workspace storage was retained by policy'] };
+      // Retention is a policy-directed success, not a cleanup failure: every removable
+      // resource is gone and the retained storage is recorded in workspace state.
+      return { ok: true, remainingResources: [], retainedResources, diagnostics: ['Workspace storage was retained by policy'] };
     }
     await deleteWorkspaceState(providerResourceID);
     return { ok: true, remainingResources: [], diagnostics: [] };

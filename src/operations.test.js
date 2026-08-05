@@ -114,6 +114,31 @@ describe('workspace provider recovery operations', () => {
     expect(cleanup.ok).toBe(true);
   });
 
+  it('rejects forged recovery metadata on the cleanup path without provider commands', async () => {
+    const workspace = recoveredWorkspace();
+    await seedState(workspace);
+    const operations = createWorkspaceProviderOperations({ policy, sourceDirectory });
+    const forgedResource = { ...workspace, extra: { ...workspace.extra, providerResourceID: 'ws-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' } };
+    const forgedProject = { ...workspace, projectID: 'project-2' };
+
+    await expect(operations.cleanupWorkspace(forgedResource)).rejects.toThrow(/state identity mismatch/);
+    await expect(operations.cleanupWorkspace(forgedProject)).rejects.toThrow(/project identity/);
+    expect(provider.remove).not.toHaveBeenCalled();
+  });
+
+  it('keeps a degraded drifted workspace deletable without requiring healthy reconciliation', async () => {
+    const workspace = recoveredWorkspace();
+    await seedState(workspace);
+    provider.reconcile.mockResolvedValue({ status: 'degraded', diagnostics: [{ code: 'WORKSPACE_RECONCILE_FAILED', message: 'runtime is down' }] });
+    const operations = createWorkspaceProviderOperations({ policy, sourceDirectory });
+
+    const cleanup = await operations.cleanupWorkspace(workspace);
+
+    expect(cleanup.ok).toBe(true);
+    expect(provider.reconcile).not.toHaveBeenCalled();
+    expect(provider.remove).toHaveBeenCalledWith(expect.objectContaining({ id: 'recovered-id', extra: expect.objectContaining({ controlPlaneWorkspaceID: 'recovered-id', originalControlPlaneWorkspaceID: 'original-id' }) }));
+  });
+
   it('repeats adoption idempotently without changing immutable ownership', async () => {
     const workspace = recoveredWorkspace();
     await seedState(workspace);

@@ -42,15 +42,55 @@ export function createMetadata(info, provider, policy, resourceRefs, identity = 
 
 export function readMetadata(info, expectedProvider, policy) {
   const meta = parseWorkspaceMetadata(info?.extra);
+  verifyMetadataIdentity(meta, info, expectedProvider);
+  if (policy && meta.policyFingerprint !== fingerprintPolicy({ ...policy, defaultImage: meta.imageDigest })) {
+    const error = new Error('Workspace policy fingerprint does not match the active policy');
+    error.code = 'WORKSPACE_POLICY_MISMATCH';
+    throw error;
+  }
+  verifyCanonicalResourceRefs(meta, canonicalResourceRefs(meta.providerResourceID, meta.provider, policy));
+  return meta;
+}
+
+// Cleanup must stay possible after the active policy changes: ownership is proven by
+// immutable identity, canonical naming, and provider labels, not by policy equality.
+// A fingerprint mismatch is therefore reported as a diagnostic instead of a failure,
+// and canonical naming is validated against the policy shape recorded at creation.
+export function readCleanupMetadata(info, expectedProvider, policy) {
+  const meta = parseWorkspaceMetadata(info?.extra);
+  verifyMetadataIdentity(meta, info, expectedProvider);
+  verifyCanonicalResourceRefs(meta, canonicalResourceRefs(meta.providerResourceID, meta.provider, cleanupPolicyShape(meta)));
+  const diagnostics = [];
+  if (policy && meta.policyFingerprint !== fingerprintPolicy({ ...policy, defaultImage: meta.imageDigest })) {
+    diagnostics.push('Workspace was created under a different policy; cleanup used the resources recorded at creation');
+  }
+  return { meta, diagnostics };
+}
+
+function verifyMetadataIdentity(meta, info, expectedProvider) {
   if (expectedProvider && meta.provider !== expectedProvider) throw new Error(`Expected ${expectedProvider} workspace metadata, got ${meta.provider}`);
   if (info?.projectID && String(info.projectID) !== meta.projectID) throw new Error('Workspace project identity does not match metadata');
-  if (policy && meta.policyFingerprint !== fingerprintPolicy({ ...policy, defaultImage: meta.imageDigest })) throw new Error('Workspace policy fingerprint does not match the active policy');
   if (meta.authRef !== createTokenRef(meta.providerResourceID)) throw new Error('Workspace authentication reference is not canonical');
-  const canonical = canonicalResourceRefs(meta.providerResourceID, meta.provider, policy);
+}
+
+function verifyCanonicalResourceRefs(meta, canonical) {
   for (const [key, value] of Object.entries(canonical)) {
     if (meta.resourceRefs[key] !== value) throw new Error(`Workspace metadata resource reference is not canonical: ${key}`);
   }
-  return meta;
+}
+
+function cleanupPolicyShape(meta) {
+  if (meta.provider !== 'kubernetes') return {};
+  const refs = meta.resourceRefs ?? {};
+  if (typeof refs.namespace !== 'string' || !refs.namespace) throw new Error('Workspace metadata namespace reference is missing');
+  return {
+    kubernetes: {
+      namespace: refs.namespace,
+      connectivity: refs.ingress ? 'ingress' : 'port-forward',
+      ingress: { tls: { mode: refs.ingressTLSSecret ? 'cert-manager' : 'existing-secret' } },
+    },
+    egress: { mode: refs.gatewayDeployment ? 'managed' : 'external' },
+  };
 }
 
 export function canonicalResourceRefs(providerResourceID, provider, policy) {

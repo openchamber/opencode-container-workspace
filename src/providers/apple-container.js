@@ -2,14 +2,14 @@ import { createServer } from 'node:net';
 import { basename, dirname } from 'node:path';
 import { commandExists, run, runJson } from '../process.js';
 import { OwnershipError, ProviderUnavailableError } from '../errors.js';
-import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
+import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readCleanupMetadata, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
 import { createWorkspaceSecrets, getWorkspaceToken, rotateWorkspaceCredentials, selectGrantedCredentials } from '../auth.js';
 import { requireAppleContainerEgress, validateImage } from '../policy.js';
 import { waitForHttpHealth } from '../health.js';
 import { PROVIDER_MODEL_AUTH_FILE, PROVIDER_SECRET_DIRECTORY, PROVIDER_TOKEN_FILE, runtimeCommand, runtimeEnvironment } from '../runtime-command.js';
 import { cleanupTransaction, createTransaction } from '../lifecycle.js';
 import { readWorkspaceState, stateRoot, writeWorkspaceState } from '../state-store.js';
-import { createSourceSnapshot } from '../snapshot.js';
+import { createSourceSnapshot, resolveSnapshotSource } from '../snapshot.js';
 import { ARTIFACT_LIMITS, RUNTIME_ARTIFACT_SCRIPT } from '../artifact.js';
 
 export function createAppleContainerProvider({ policy, sourceDirectory }) {
@@ -21,8 +21,10 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
     if (process.platform !== 'darwin') throw new ProviderUnavailableError('Apple Container is supported only on macOS', { provider, code: 'WORKSPACE_PROVIDER_UNSUPPORTED' });
     requireAppleContainerEgress(policy);
     if (policy.egress.mode === 'managed') throw new ProviderUnavailableError('Managed gateway networking for Apple Container requires live-validated multi-network attachment', { provider, code: 'WORKSPACE_PROVIDER_CAPABILITY_UNAVAILABLE' });
-    if (!commandExists(policy.appleContainer.cli)) throw new ProviderUnavailableError('Apple Container CLI is not available', { provider });
-    await container(['system', 'status'], { timeoutMs: 15_000 });
+    if (!commandExists(policy.appleContainer.cli)) throw new ProviderUnavailableError('Apple Container CLI is not available', { provider, code: 'WORKSPACE_PROVIDER_CLI_MISSING' });
+    await container(['system', 'status'], { timeoutMs: 15_000 }).catch((cause) => {
+      throw new ProviderUnavailableError('Apple Container system service is not running', { provider, code: 'WORKSPACE_PROVIDER_DAEMON_UNAVAILABLE', cause });
+    });
     return { provider, available: true, diagnostics: ['Apple Container has no exact no-new-privileges equivalent; non-root, capability drop, read-only root, and host-only networking are enforced.'] };
   }
 
@@ -33,15 +35,16 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
     return { ...info, name: workspaceName(identity.providerResourceID, provider), directory: WORKSPACE_RUNTIME.directory, extra: createMetadata(info, provider, { ...policy, defaultImage: image }, refs, identity) };
   }
 
-  async function create(info, env = {}) {
+  async function create(info, env = {}, _from, context) {
     await preflight();
     const meta = readMetadata(info, provider, policy);
     const identity = identityFromMetadata(meta);
     const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
     const image = validateImage(policy, meta.imageDigest);
+    const snapshotSource = resolveSnapshotSource(context, sourceDirectory);
     await container(['image', 'inspect', image], { timeoutMs: 20_000 }).catch(() => container(['image', 'pull', image], { timeoutMs: 300_000 }));
     await createTransaction(identity, async (transaction) => {
-      const sourceSnapshot = await createSourceSnapshot(sourceDirectory, { temporaryRoot: stateRoot() });
+      const sourceSnapshot = await createSourceSnapshot(snapshotSource, { temporaryRoot: stateRoot() });
       try {
       if (!transaction.recovering) await assertResourcesAbsent(containerJson, refs);
       await transaction.bindSnapshot(sourceSnapshot.generation);
@@ -95,9 +98,9 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
   }
 
   async function remove(info) {
-    const meta = readMetadata(info, provider, policy);
-    const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
-    return cleanupTransaction(meta.providerResourceID, async (cleanup) => {
+    const { meta, diagnostics } = readCleanupMetadata(info, provider, policy);
+    const refs = meta.resourceRefs;
+    const result = await cleanupTransaction(meta.providerResourceID, async (cleanup) => {
       await verifyExisting(containerJson, meta);
       await cleanup.remove(`container:${refs.runtime}`, () => removeResource(container, containerJson, 'container', refs.runtime));
       await cleanup.remove(`network:${refs.network}`, () => removeResource(container, containerJson, 'network', refs.network));
@@ -110,11 +113,16 @@ export function createAppleContainerProvider({ policy, sourceDirectory }) {
         cleanup.retain(`volume:${refs.baselineVolume}`);
       }
     });
+    return { ...result, diagnostics: [...diagnostics, ...(result.diagnostics ?? [])] };
   }
 
   async function list(context) {
     const projectID = context?.instance?.project?.id;
     if (!projectID) throw new Error('Apple Container workspace discovery requires an authoritative project ID');
+    // Apple Container is intentionally unsupported off macOS, and an absent CLI means
+    // there is nothing to discover — both stay silent instead of failing every sync.
+    if (process.platform !== 'darwin') return [];
+    if (!commandExists(policy.appleContainer.cli)) return [];
     const { stdout } = await container(['list', '--all', '--format', 'json'], { timeoutMs: 20_000 });
     const result = [];
     for (const row of stdout.trim() ? JSON.parse(stdout) : []) {

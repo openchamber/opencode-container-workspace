@@ -1,16 +1,19 @@
 import { spawn } from 'node:child_process';
-import { createReadStream } from 'node:fs';
+import { createReadStream, existsSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { run, runJson, spawnBackground } from '../process.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { commandExists, run, runJson, spawnBackground } from '../process.js';
 import { CleanupError, OwnershipError, ProviderUnavailableError } from '../errors.js';
-import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
+import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readCleanupMetadata, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
 import { createWorkspaceSecrets, getWorkspaceToken, rotateWorkspaceCredentials, selectGrantedCredentials } from '../auth.js';
 import { requireKubernetesEgress, validateImage } from '../policy.js';
+import { grantedEgressPolicy } from '../egress-domains.js';
 import { waitForHttpHealth } from '../health.js';
 import { KUBERNETES_TOKEN_FILE, KUBERNETES_TOKEN_MOUNT_PATH, PROVIDER_MODEL_AUTH_FILE, runtimeCommand, runtimeEnvironment } from '../runtime-command.js';
 import { cleanupTransaction, createTransaction } from '../lifecycle.js';
 import { readWorkspaceState, writeWorkspaceState } from '../state-store.js';
-import { createSourceSnapshot } from '../snapshot.js';
+import { createSourceSnapshot, resolveSnapshotSource } from '../snapshot.js';
 import { ARTIFACT_LIMITS, RUNTIME_ARTIFACT_SCRIPT } from '../artifact.js';
 
 const portForwards = new Map();
@@ -22,9 +25,19 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
   const kubectl = (args, options = {}) => run('kubectl', [...contextArgs(policy), ...args], options);
 
   async function preflight() {
+    // Environment first, policy second: "no cluster here" is both more fundamental and
+    // more actionable than "the egress policy is incomplete", and reporting the policy
+    // gap first hides the real reason this host cannot run Kubernetes workspaces.
+    await kubectl(['version', '--client=true'], { timeoutMs: 15_000 }).catch((cause) => { throw new ProviderUnavailableError('kubectl is not available', { provider, code: 'WORKSPACE_PROVIDER_CLI_MISSING', cause }); });
+    if (!kubernetesConfigured(policy)) throw new ProviderUnavailableError('No Kubernetes configuration was found for this host', { provider, code: 'WORKSPACE_PROVIDER_NOT_CONFIGURED' });
     requireKubernetesEgress(policy);
-    await kubectl(['version', '--client=true'], { timeoutMs: 15_000 }).catch((cause) => { throw new ProviderUnavailableError('kubectl is not available', { provider, cause }); });
-    await kubectl(['get', 'namespace', policy.kubernetes.namespace, '-o', 'name'], { timeoutMs: 20_000 });
+    await kubectl(['get', 'namespace', policy.kubernetes.namespace, '-o', 'name'], { timeoutMs: 20_000 }).catch((cause) => {
+      const text = `${cause?.stderr ?? ''} ${cause instanceof Error ? cause.message : String(cause)}`;
+      if (/NotFound|not found/i.test(text)) {
+        throw new ProviderUnavailableError(`Kubernetes namespace does not exist: ${policy.kubernetes.namespace}`, { provider, code: 'WORKSPACE_PROVIDER_NAMESPACE_MISSING', cause });
+      }
+      throw new ProviderUnavailableError(`Kubernetes cluster is not reachable: ${cause instanceof Error ? cause.message : String(cause)}`, { provider, code: 'WORKSPACE_PROVIDER_CLUSTER_UNREACHABLE', cause });
+    });
     for (const [verb, resource] of requiredPermissions(policy)) {
       const { stdout } = await kubectl(['auth', 'can-i', verb, resource, '-n', policy.kubernetes.namespace], { timeoutMs: 20_000 });
       if (stdout.trim() !== 'yes') throw new ProviderUnavailableError(`Kubernetes RBAC denies ${verb} ${resource} in namespace ${policy.kubernetes.namespace}`, { provider });
@@ -50,14 +63,15 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
     return { ...info, name: workspaceName(identity.providerResourceID, provider), directory: WORKSPACE_RUNTIME.directory, extra: createMetadata(info, provider, { ...policy, defaultImage: image }, refs, identity) };
   }
 
-  async function create(info, env = {}) {
+  async function create(info, env = {}, _from, context) {
     await preflight();
     const meta = readMetadata(info, provider, policy);
     const identity = identityFromMetadata(meta);
     const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
     const image = validateImage(policy, meta.imageDigest);
+    const snapshotSource = resolveSnapshotSource(context, sourceDirectory);
     await createTransaction(identity, async (transaction) => {
-      const sourceSnapshot = await createSourceSnapshot(sourceDirectory);
+      const sourceSnapshot = await createSourceSnapshot(snapshotSource);
       try {
       if (!transaction.recovering) await assertResourcesAbsent(kubectl, refs);
       await transaction.bindSnapshot(sourceSnapshot.generation);
@@ -65,7 +79,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
       const secrets = await createWorkspaceSecrets(meta.providerResourceID, grantedCredentials);
       const hostPort = await availableStablePort(meta.providerResourceID);
       await transaction.update({ hostPort, imageDigest: image });
-      const manifests = buildManifests({ identity, refs, image, policy, token: secrets.token, modelAuth: secrets.modelAuth });
+      const manifests = buildManifests({ identity, refs, image, policy: { ...policy, egress: grantedEgressPolicy(policy, grantedCredentials) }, token: secrets.token, modelAuth: secrets.modelAuth });
       for (const manifest of manifests.infrastructure) {
         const resource = `${manifest.kind.toLowerCase()}:${manifest.metadata.name}`;
         await transaction.create(resource, () => createManifest(kubectl, manifest), async () => {
@@ -121,15 +135,15 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
   }
 
   async function remove(info) {
-    const meta = readMetadata(info, provider, policy);
-    const refs = canonicalResourceRefs(meta.providerResourceID, provider, policy);
+    const { meta, diagnostics } = readCleanupMetadata(info, provider, policy);
+    const refs = meta.resourceRefs;
     stopPortForward(meta.providerResourceID);
-    return cleanupTransaction(meta.providerResourceID, async (cleanup) => {
-      await verifyExistingResources(kubectl, meta, policy);
+    const result = await cleanupTransaction(meta.providerResourceID, async (cleanup) => {
+      await verifyExistingResources(kubectl, meta, policy, { requireIssuer: false });
       for (const [kind, name] of expectedResources(refs).filter(([resourceKind]) => !['pvc'].includes(resourceKind))) {
         await cleanup.remove(`${kind}:${name}`, () => deleteResource(kubectl, kind, name, refs.namespace));
       }
-      if (refs.ingressTLSSecret) await cleanup.remove(`secret:${refs.ingressTLSSecret}`, () => deleteCertManagerTLSSecret(kubectl, refs, policy));
+      if (refs.ingressTLSSecret) await cleanup.remove(`secret:${refs.ingressTLSSecret}`, () => deleteCertManagerTLSSecret(kubectl, refs, policy, { requireIssuer: false }));
       if (!policy.retention.preserveOnDelete) {
         await cleanup.remove(`pvc:${refs.mutablePVC}`, () => deleteResource(kubectl, 'pvc', refs.mutablePVC, refs.namespace));
         await cleanup.remove(`pvc:${refs.baselinePVC}`, () => deleteResource(kubectl, 'pvc', refs.baselinePVC, refs.namespace));
@@ -138,11 +152,16 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
         cleanup.retain(`pvc:${refs.baselinePVC}`);
       }
     });
+    return { ...result, diagnostics: [...diagnostics, ...(result.diagnostics ?? [])] };
   }
 
   async function list(context) {
     const projectID = context?.instance?.project?.id;
     if (!projectID) throw new Error('Kubernetes workspace discovery requires an authoritative project ID');
+    // Discovery on hosts without any Kubernetes setup must stay silent: no kubectl or
+    // no kubeconfig means there is nothing to discover, not a discovery failure.
+    if (!commandExists('kubectl')) return [];
+    if (!kubernetesConfigured(policy)) return [];
     const selector = `openchamber.io/managed=true,openchamber.io/provider=kubernetes,openchamber.io/role=runtime,openchamber.io/project-id=${labelHash(projectID)}`;
     const { stdout } = await kubectl(['get', 'deployment', '-n', policy.kubernetes.namespace, '-l', selector, '-o', 'json'], { timeoutMs: 30_000 });
     const result = [];
@@ -342,10 +361,10 @@ async function verifyKubernetesWorkspace(kubectl, meta, policy) {
   if (meta.resourceRefs.ingressTLSSecret) await verifyCertManagerTLSSecret(kubectl, meta.resourceRefs, policy);
 }
 
-async function verifyExistingResources(kubectl, meta, policy) {
+async function verifyExistingResources(kubectl, meta, policy, { requireIssuer = true } = {}) {
   const identity = identityFromMetadata(meta);
   for (const [kind, name, role] of expectedResources(meta.resourceRefs)) await verifyResource(kubectl, kind, name, meta.resourceRefs.namespace, providerLabels(identity, role)).catch((error) => { if (!isNotFound(error)) throw error; });
-  if (meta.resourceRefs.ingressTLSSecret) await verifyCertManagerTLSSecret(kubectl, meta.resourceRefs, policy).catch((error) => { if (!isNotFound(error)) throw error; });
+  if (meta.resourceRefs.ingressTLSSecret) await verifyCertManagerTLSSecret(kubectl, meta.resourceRefs, policy, { requireIssuer }).catch((error) => { if (!isNotFound(error)) throw error; });
 }
 
 async function waitForCertManagerTLSSecret(kubectl, refs, policy) {
@@ -371,16 +390,19 @@ async function certManagerTLSSecretExistsOwned(kubectl, refs, policy) {
   }
 }
 
-async function verifyCertManagerTLSSecret(kubectl, refs, policy) {
+async function verifyCertManagerTLSSecret(kubectl, refs, policy, { requireIssuer = true } = {}) {
   const { stdout } = await kubectl(['get', 'secret', refs.ingressTLSSecret, '-n', refs.namespace, '-o', 'json'], { timeoutMs: 30_000 });
   const secret = JSON.parse(stdout);
   const annotations = secret.metadata?.annotations ?? {};
-  if (secret.type !== 'kubernetes.io/tls' || annotations['cert-manager.io/certificate-name'] !== refs.ingressTLSSecret || annotations['cert-manager.io/issuer-kind'] !== 'ClusterIssuer' || annotations['cert-manager.io/issuer-name'] !== policy.kubernetes.ingress.tls.clusterIssuer) throw new OwnershipError(`Kubernetes cert-manager TLS secret ownership mismatch for ${refs.ingressTLSSecret}`);
+  // Cleanup after a policy change cannot rely on the currently configured issuer name;
+  // certificate name, issuer kind, and secret type still prove cert-manager ownership.
+  const issuerMatches = requireIssuer ? annotations['cert-manager.io/issuer-name'] === policy.kubernetes.ingress.tls.clusterIssuer : true;
+  if (secret.type !== 'kubernetes.io/tls' || annotations['cert-manager.io/certificate-name'] !== refs.ingressTLSSecret || annotations['cert-manager.io/issuer-kind'] !== 'ClusterIssuer' || !issuerMatches) throw new OwnershipError(`Kubernetes cert-manager TLS secret ownership mismatch for ${refs.ingressTLSSecret}`);
 }
 
-async function deleteCertManagerTLSSecret(kubectl, refs, policy) {
+async function deleteCertManagerTLSSecret(kubectl, refs, policy, { requireIssuer = true } = {}) {
   if (!await certManagerTLSSecretExists(kubectl, refs)) return;
-  await verifyCertManagerTLSSecret(kubectl, refs, policy);
+  await verifyCertManagerTLSSecret(kubectl, refs, policy, { requireIssuer });
   await deleteResource(kubectl, 'secret', refs.ingressTLSSecret, refs.namespace);
 }
 
@@ -452,6 +474,17 @@ function stopPortForward(id) {
 
 function contextArgs(policy) {
   return policy.kubernetes.context ? ['--context', policy.kubernetes.context] : [];
+}
+
+function kubernetesConfigured(policy) {
+  if (policy.kubernetes.context) return true;
+  const kubeconfig = process.env.KUBECONFIG;
+  if (typeof kubeconfig === 'string' && kubeconfig.trim()) return true;
+  try {
+    return existsSync(join(homedir(), '.kube', 'config'));
+  } catch {
+    return false;
+  }
 }
 
 function selectorString(selector) {
