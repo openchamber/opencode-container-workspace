@@ -92,6 +92,13 @@ export function createWorkspaceProviderOperations(options = {}) {
     async validateProvider(kind) {
       return providers.get(parseProviderKind(kind)).validate();
     },
+    /** Completes one setup requirement for a provider that can do so itself. */
+    async prepareProvider(kind, action) {
+      const target = providers.get(parseProviderKind(kind));
+      if (typeof target.setup !== 'function') throw new Error(`Provider ${kind} has no setup actions`);
+      if (typeof action !== 'string' || !action) throw new TypeError('action is required');
+      return target.setup(action);
+    },
     async discoverProject(projectID) {
       if (typeof projectID !== 'string' || !projectID) throw new TypeError('projectID is required');
       const workspaces = [];
