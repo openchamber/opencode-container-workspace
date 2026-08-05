@@ -92,6 +92,12 @@ export function createWorkspaceProviderOperations(options = {}) {
     async validateProvider(kind) {
       return providers.get(parseProviderKind(kind)).validate();
     },
+    /** Read-only view of what the host already knows about reaching this provider. */
+    async describeProvider(kind) {
+      const target = providers.get(parseProviderKind(kind));
+      if (typeof target.describe !== 'function') return { provider: kind, contexts: [], currentContext: null };
+      return target.describe();
+    },
     /** Completes one setup requirement for a provider that can do so itself. */
     async prepareProvider(kind, action) {
       const target = providers.get(parseProviderKind(kind));

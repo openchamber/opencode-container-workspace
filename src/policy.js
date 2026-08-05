@@ -83,9 +83,14 @@ export function requireDockerEgress(policy) {
   throw new PolicyError('Docker external egress requires egress.proxyUrl');
 }
 
-export function requireKubernetesEgress(policy) {
-  if (policy.egress.dnsCIDRs.length === 0) throw new PolicyError('Kubernetes egress requires egress.dnsCIDRs for controlled DNS');
-  for (const cidr of policy.egress.dnsCIDRs) validateCIDR(cidr, 'Workspace egress DNS CIDR');
+/**
+ * @param dnsCIDRs the DNS ranges actually in force — discovered from the cluster when the
+ *        policy leaves them unset, so a discovered value is validated as strictly as a
+ *        configured one.
+ */
+export function requireKubernetesEgress(policy, dnsCIDRs = policy.egress.dnsCIDRs) {
+  if (dnsCIDRs.length === 0) throw new PolicyError('Kubernetes egress requires egress.dnsCIDRs for controlled DNS');
+  for (const cidr of dnsCIDRs) validateCIDR(cidr, 'Workspace egress DNS CIDR');
   if (policy.egress.mode === 'managed') {
     validateGatewayImage(policy.egress.gatewayImage);
     return;
