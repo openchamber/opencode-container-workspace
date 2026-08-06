@@ -3,7 +3,7 @@ import { createReadStream } from 'node:fs';
 import { chmod, lstat, mkdtemp, readFile, readdir, readlink, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { run } from './process.js';
+import { run, runToFile } from './process.js';
 
 const DEFAULT_LIMITS = Object.freeze({ maxEntries: 100_000, maxBytes: 2 * 1024 ** 3, maxFileBytes: 256 * 1024 ** 2 });
 const RESERVED_ROOTS = new Set(['.openchamber', '.openchamber-runtime']);
@@ -37,7 +37,10 @@ export async function createSourceSnapshot(sourceDirectory, options = {}) {
   await chmod(temporaryDirectory, 0o700);
   const archivePath = join(temporaryDirectory, 'source.tar');
   try {
-    await run('tar', ['-cf', archivePath, '--exclude', './.git', '.'], { cwd: root, env: { COPYFILE_DISABLE: '1' }, timeoutMs: options.timeoutMs ?? 300_000, maxOutputBytes: 64 * 1024 });
+    // Written through stdout rather than by naming the file to tar: a Windows path is a
+    // remote host to GNU tar and an ordinary path to bsdtar, and PATH order decides which
+    // one answers.
+    await runToFile('tar', ['-cf', '-', '--exclude', './.git', '.'], archivePath, { cwd: root, env: { COPYFILE_DISABLE: '1' }, timeoutMs: options.timeoutMs ?? 300_000 });
     const after = await scanSourceTree(root, limits);
     if (JSON.stringify(before.entries) !== JSON.stringify(after.entries)) throw new Error('Workspace source changed while the immutable snapshot was being created');
     const generation = createHash('sha256').update(JSON.stringify(before.entries.map(({ mtimeNs, ...entry }) => entry))).digest('hex');
