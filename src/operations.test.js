@@ -43,6 +43,24 @@ describe('workspace provider recovery operations', () => {
     await Promise.all([rm(stateDirectory, { recursive: true, force: true }), rm(sourceDirectory, { recursive: true, force: true })]);
   });
 
+  it('reads policy state from the workspace itself without contacting the provider', async () => {
+    const operations = createWorkspaceProviderOperations({ policy, sourceDirectory });
+    const workspace = recoveredWorkspace();
+
+    await expect(operations.describeWorkspacePolicyState(workspace)).resolves.toMatchObject({ matchesPolicy: true });
+    // Labelling a list must not cost one provider probe per row.
+    expect(provider.list).not.toHaveBeenCalled();
+    expect(provider.reconcile).not.toHaveBeenCalled();
+  });
+
+  it('reports a workspace created under settings that are no longer in force', async () => {
+    const operations = createWorkspaceProviderOperations({ policy, sourceDirectory });
+    const workspace = recoveredWorkspace();
+    const drifted = { ...workspace, extra: { ...workspace.extra, policyFingerprint: 'b'.repeat(64) } };
+
+    await expect(operations.describeWorkspacePolicyState(drifted)).resolves.toMatchObject({ matchesPolicy: false, code: 'WORKSPACE_POLICY_MISMATCH' });
+  });
+
   function recoveredWorkspace(overrides = {}) {
     const identity = {
       provider: 'docker',
