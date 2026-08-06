@@ -1,5 +1,6 @@
 import { parseProviderKind, parseWorkspaceMetadata, parseWorkspaceRecord } from './contracts.js';
 import { readPolicy } from './policy.js';
+import { readMetadata } from './metadata.js';
 import { createDockerProvider } from './providers/docker.js';
 import { createKubernetesProvider } from './providers/kubernetes.js';
 import { createAppleContainerProvider } from './providers/apple-container.js';
@@ -119,6 +120,23 @@ export function createWorkspaceProviderOperations(options = {}) {
         }
       }
       return { projectID, workspaces, failures, completeProviders };
+    },
+    /**
+     * Whether a workspace still matches the settings in force, read from its own
+     * metadata without contacting the provider. Kept separate from inspectWorkspace,
+     * which runs a health check: a surface labelling a list must not pay for one probe
+     * per row, and the answer here is already recorded in the workspace itself.
+     */
+    async describeWorkspacePolicyState(workspace) {
+      parseWorkspaceRecord(workspace);
+      const provider = providerForWorkspace(workspace);
+      try {
+        readMetadata(workspace, provider.kind, policy);
+        return { provider: provider.kind, matchesPolicy: true };
+      } catch (error) {
+        if (error?.code === 'WORKSPACE_POLICY_MISMATCH') return { provider: provider.kind, matchesPolicy: false, code: error.code };
+        throw error;
+      }
     },
     async inspectWorkspace(workspace) {
       workspace = await adoptWorkspace(workspace);
