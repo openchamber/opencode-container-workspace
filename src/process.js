@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
+import { createWriteStream } from 'node:fs';
 import { canonicalWorkspaceLabelID } from './label-id.js';
 import { ProcessError } from './errors.js';
 
@@ -90,6 +91,67 @@ export function run(binary, args, options = {}) {
       clearTimeout(timer);
       options.signal?.removeEventListener('abort', abort);
       resolve({ stdout: decode(stdout), stderr: decode(stderr), truncated });
+    });
+  });
+}
+
+/**
+ * Runs a command and writes its stdout to a file, so the destination never has to be
+ * passed to the command as an argument.
+ *
+ * That matters on Windows: GNU tar reads `C:\path` as a remote `host:path` and fails
+ * with "Cannot connect to C", while the bsdtar shipped in System32 accepts it. Which one
+ * runs is decided by PATH order, so the same command works or fails depending on whether
+ * Git for Windows appears first — and Git for Windows very often does. Handing the path
+ * over stdout removes the question instead of detecting the flavour, which would have to
+ * be re-detected for every tool that takes a path.
+ */
+export function runToFile(binary, args, destinationPath, options = {}) {
+  if (typeof binary !== 'string' || !binary || !Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) {
+    return Promise.reject(new TypeError('Process runner requires an executable and string argument array'));
+  }
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const display = formatCommand(binary, args, options.sensitiveArgs ?? [], []);
+  return new Promise((resolve, reject) => {
+    const output = createWriteStream(destinationPath);
+    const child = spawn(binary, args, {
+      cwd: options.cwd,
+      env: options.env ? { ...process.env, ...options.env } : process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    let stderr = '';
+    let settled = false;
+    const fail = (kind, message, details = {}) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      output.destroy();
+      reject(new ProcessError(`${display} ${message}${stderr ? `: ${stderr.trim()}` : ''}`.trim(), { kind, stderr, ...details }));
+    };
+    const timer = setTimeout(() => {
+      if (process.platform === 'win32' && child.pid) spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+      else child.kill('SIGKILL');
+      fail('timeout', `timed out after ${timeoutMs}ms`);
+    }, timeoutMs);
+
+    child.stderr.on('data', (chunk) => { if (stderr.length < 64 * 1024) stderr += String(chunk); });
+    child.on('error', (error) => fail('spawn', `could not start: ${error.message}`));
+    output.on('error', (error) => fail('exit', `could not write output: ${error.message}`));
+    child.stdout.pipe(output);
+    child.on('close', (code, signal) => {
+      if (settled) return;
+      if (code !== 0) {
+        fail('exit', `failed with ${code ?? signal}`, { exitCode: code, signal });
+        return;
+      }
+      // Resolve only once the file is closed, so a caller may read it immediately.
+      output.end(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ stderr });
+      });
     });
   });
 }
