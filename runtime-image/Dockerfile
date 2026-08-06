@@ -1,7 +1,7 @@
 ARG NODE_BASE_IMAGE
 FROM ${NODE_BASE_IMAGE}
 
-ARG OPENCODE_VERSION=1.18.8
+ARG OPENCODE_VERSION=1.18.12
 ARG NPM_VERSION=11.18.0
 # npm vendors these two and still ships versions with published denial-of-service
 # advisories, so the fixed releases are installed over the vendored copies. Both are
