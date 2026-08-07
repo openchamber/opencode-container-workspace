@@ -29,12 +29,12 @@ describe('windows state protection', () => {
   });
 
   it('reads every principal out of a list, including one whose name has a space', () => {
-    const path = 'C:\\Users\\BOHDAN~1\\AppData\\Local\\Temp\\acl-probe';
+    const path = 'C:\\Users\\Sam\\AppData\\Local\\Temp\\acl-probe';
     const output = [
       `${path} Everyone:(OI)(CI)(F)`,
       '                                             NT AUTHORITY\\SYSTEM:(I)(OI)(CI)(F)',
       '                                             BUILTIN\\Administrators:(I)(OI)(CI)(F)',
-      '                                             DESKTOP-CP9J2I4\\Bohdan Triapitsyn:(I)(OI)(CI)(F)',
+      '                                             EXAMPLE-PC\\Sam:(I)(OI)(CI)(F)',
       '',
       'Successfully processed 1 files; Failed processing 0 files',
     ].join('\r\n');
@@ -42,7 +42,7 @@ describe('windows state protection', () => {
       'Everyone',
       'NT AUTHORITY\\SYSTEM',
       'BUILTIN\\Administrators',
-      'DESKTOP-CP9J2I4\\Bohdan Triapitsyn',
+      'EXAMPLE-PC\\Sam',
     ]);
   });
 
