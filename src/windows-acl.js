@@ -73,7 +73,7 @@ async function currentAccountSid() {
  *
  *     C:\…\workspaces Everyone:(OI)(CI)(F)
  *                     NT AUTHORITY\SYSTEM:(I)(OI)(CI)(F)
- *                     DESKTOP-CP9J2I4\Bohdan Triapitsyn:(I)(OI)(CI)(F)
+ *                     EXAMPLE-PC\Sam:(I)(OI)(CI)(F)
  *
  * The path has to come off first: it contains the drive's colon, and a principal may
  * contain spaces, so there is no separator that tells them apart on that first line.
