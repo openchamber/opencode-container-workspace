@@ -2,16 +2,27 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { run } from './process.js';
+import { resetWindowsAclCache } from './windows-acl.js';
 import { readWorkspaceSecret, readWorkspaceState, withWorkspaceLock, workspaceStateDirectory, writeWorkspaceSecret, writeWorkspaceState } from './state-store.js';
+
+const icacls = `${process.env.SystemRoot || 'C:\\Windows'}\\System32\\icacls.exe`;
 
 describe('workspace state store', () => {
   let root;
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), 'workspace-state-test-'));
     process.env.OPENCHAMBER_WORKSPACE_STATE_DIR = root;
+    if (process.platform === 'win32') {
+      // A profile's temporary directory is already private, so a store created there
+      // would look protected whether or not the code protects anything. This one is
+      // opened to everyone first, and the test can then observe it being closed.
+      await run(icacls, [root, '/grant', '*S-1-1-0:(OI)(CI)F', '/q']);
+    }
   });
   afterEach(async () => {
     delete process.env.OPENCHAMBER_WORKSPACE_STATE_DIR;
+    resetWindowsAclCache();
     await rm(root, { recursive: true, force: true });
   });
 
@@ -21,13 +32,17 @@ describe('workspace state store', () => {
     await writeWorkspaceSecret(id, 'endpoint-token', 'secret');
     expect(await readWorkspaceState(id)).toMatchObject({ lifecycle: 'ready' });
     expect(await readWorkspaceSecret(id, 'endpoint-token')).toBe('secret');
-    // POSIX modes are how this store restricts its state and secrets, and Windows does
-    // not implement them: `chmod` is close to a no-op there and every file reports 0o666.
-    // Asserting the modes on Windows would only restate that, so the check is skipped —
-    // but the protection genuinely is absent there, standing only on ACLs inherited from
-    // wherever the data directory happens to live. Enforcing it explicitly on Windows is
-    // outstanding work, not a platform difference that can be waved through.
-    if (process.platform !== 'win32') {
+    // Each platform is asked about the mechanism that actually restricts the store there:
+    // POSIX modes where they are implemented, and the inherited ACL on Windows, which
+    // accepts a chmod and honours none of it.
+    if (process.platform === 'win32') {
+      const secret = join(workspaceStateDirectory(id), 'secrets', 'endpoint-token');
+      const icacls = `${process.env.SystemRoot || 'C:\\Windows'}\\System32\\icacls.exe`;
+      const { stdout } = await run(icacls, [secret]);
+      const granted = stdout.split(/\r?\n/).filter((line) => line.includes(':(')).join('\n');
+      expect(granted).not.toMatch(/Everyone|BUILTIN\\Users|Authenticated Users/i);
+      expect(granted).toContain(process.env.USERNAME);
+    } else {
       expect((await stat(workspaceStateDirectory(id))).mode & 0o777).toBe(0o700);
       expect((await stat(join(workspaceStateDirectory(id), 'state.json'))).mode & 0o777).toBe(0o600);
       expect((await stat(join(workspaceStateDirectory(id), 'secrets', 'endpoint-token'))).mode & 0o777).toBe(0o600);
