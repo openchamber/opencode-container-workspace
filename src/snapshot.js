@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { chmod, lstat, mkdtemp, readFile, readdir, readlink, realpath, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, parse as parsePath, relative, resolve, sep } from 'node:path';
 import { run, runToFile } from './process.js';
 
 const DEFAULT_LIMITS = Object.freeze({ maxEntries: 100_000, maxBytes: 2 * 1024 ** 3, maxFileBytes: 256 * 1024 ** 2 });
@@ -23,7 +23,37 @@ export function resolveSnapshotSource(context, fallbackDirectory) {
   if (resolve(candidate) === resolve(WORKSPACE_RUNTIME_DIRECTORY)) {
     throw new Error('Workspace source directory resolves to the workspace runtime path; refusing to snapshot');
   }
+  refuseUnsafeSnapshotRoot(candidate);
   return candidate;
+}
+
+/**
+ * Refuses to copy a whole account or filesystem into a workspace.
+ *
+ * A snapshot is handed to the runtime, where workspace code executes. A home directory
+ * carries SSH keys, cloud credentials, browser profiles and tokens; a filesystem root
+ * carries every account on the machine. Neither is a project, and copying either would
+ * put the operator's entire credential store where untrusted code can read it — the one
+ * thing this product exists to prevent. Nothing else stopped it: the size and symlink
+ * limits are incidental, and reaching either means the copy already began.
+ */
+export function refuseUnsafeSnapshotRoot(candidate) {
+  const resolved = resolve(candidate);
+  const home = safeResolve(homedir());
+  if (home && resolved === home) {
+    throw new Error('Workspace source directory is the home directory; refusing to copy an entire account into a workspace. Choose a project directory.');
+  }
+  if (resolved === parsePath(resolved).root) {
+    throw new Error('Workspace source directory is a filesystem root; refusing to copy an entire filesystem into a workspace. Choose a project directory.');
+  }
+}
+
+function safeResolve(value) {
+  try {
+    return typeof value === 'string' && value ? resolve(value) : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function createSourceSnapshot(sourceDirectory, options = {}) {

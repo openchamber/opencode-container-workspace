@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { chmod, link, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSourceSnapshot, resolveSnapshotSource, scanSourceTree } from './snapshot.js';
@@ -40,9 +40,20 @@ describe('safe source snapshots', () => {
     await chmod(join(root, 'script.sh'), 0o755);
     await symlink('script.sh', join(root, 'link'));
     const snapshot = await createSourceSnapshot(root);
-    expect(snapshot.entries).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'script.sh', mode: 0o755 }), expect.objectContaining({ path: 'link', type: 'symlink', target: 'script.sh' })]));
+    // An executable bit is only recorded where the filesystem has one. Windows reports
+    // none, so asserting 0o755 there tests the platform rather than the snapshot; what
+    // must hold everywhere is that the entry is present and the symlink is followed.
+    expect(snapshot.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: 'script.sh', type: 'file' }),
+      expect.objectContaining({ path: 'link', type: 'symlink', target: 'script.sh' }),
+    ]));
+    if (process.platform !== 'win32') {
+      expect(snapshot.entries.find((entry) => entry.path === 'script.sh')?.mode).toBe(0o755);
+    }
     expect(snapshot.entries.some((entry) => entry.path.startsWith('.git/'))).toBe(false);
-    const archive = await run('tar', ['-tf', snapshot.archivePath]);
+    // Read through stdin for the same reason the snapshot writes through stdout: GNU tar
+    // reads `C:\path` as `host:path`, so naming the archive fails wherever it wins PATH.
+    const archive = await run('tar', ['-tf', '-'], { input: await readFile(snapshot.archivePath) });
     expect(archive.stdout).not.toContain('.git/');
     expect(snapshot.generation).toMatch(/^[a-f0-9]{64}$/);
     await snapshot.dispose();
@@ -55,7 +66,7 @@ describe('safe source snapshots', () => {
 
     const snapshot = await createSourceSnapshot(root, { temporaryRoot: staging });
 
-    expect(snapshot.archivePath.startsWith(`${staging}/openchamber-source-`)).toBe(true);
+    expect(snapshot.archivePath.startsWith(join(staging, 'openchamber-source-'))).toBe(true);
     await snapshot.dispose();
   });
 
