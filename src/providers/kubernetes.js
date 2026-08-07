@@ -260,6 +260,19 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
     stopPortForward(meta.providerResourceID);
     const result = await cleanupTransaction(meta.providerResourceID, async (cleanup) => {
       await verifyExistingResources(kubectl, meta, policy, { requireIssuer: false });
+      // The seed pod is deleted by a completed create, so it is not a canonical
+      // resource and stays out of expectedResources — verification of a healthy
+      // workspace must not demand it. But an interrupted create leaves it behind, and
+      // while it exists the PVCs it mounts never finish terminating: their protection
+      // finalizer waits on the pod, both PVC deletes below time out, and cleanup
+      // reports incomplete forever. Removing it here, ownership-verified, is what
+      // makes remove idempotent for that leftover.
+      const seedPod = `${refs.deployment}-seed`;
+      await cleanup.remove(`pod:${seedPod}`, async () => {
+        if (await resourceExistsOwned(kubectl, 'pod', seedPod, refs.namespace, providerLabels(identityFromMetadata(meta), 'seed'))) {
+          await deleteResource(kubectl, 'pod', seedPod, refs.namespace);
+        }
+      });
       for (const [kind, name] of expectedResources(refs).filter(([resourceKind]) => !['pvc'].includes(resourceKind))) {
         await cleanup.remove(`${kind}:${name}`, () => deleteResource(kubectl, kind, name, refs.namespace));
       }

@@ -1,7 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const processMocks = vi.hoisted(() => ({ commandExists: vi.fn(() => true), run: vi.fn(), runJson: vi.fn() }));
+vi.mock('../process.js', async (importOriginal) => ({ ...await importOriginal(), ...processMocks }));
+
 import { readPolicy } from '../policy.js';
 import { buildManifests, createKubernetesProvider, KUBERNETES_SEED_EXTRACT_COMMAND, kubernetesCredentialRefreshCommands } from './kubernetes.js';
-import { canonicalResourceRefs, deriveWorkspaceIdentity } from '../metadata.js';
+import { canonicalResourceRefs, deriveWorkspaceIdentity, providerLabels } from '../metadata.js';
 
 function policy() {
   return readPolicy({
@@ -118,3 +125,79 @@ describe('Kubernetes provider manifests', () => {
     }));
   });
 });
+
+describe('Kubernetes provider cleanup', () => {
+  let stateDirectory;
+  beforeEach(async () => {
+    stateDirectory = await mkdtemp(join(tmpdir(), 'workspace-kubernetes-test-'));
+    process.env.OPENCHAMBER_WORKSPACE_STATE_DIR = stateDirectory;
+    processMocks.commandExists.mockReturnValue(true);
+    processMocks.run.mockReset();
+    processMocks.runJson.mockReset().mockRejectedValue(new Error('not found'));
+  });
+  afterEach(async () => {
+    delete process.env.OPENCHAMBER_WORKSPACE_STATE_DIR;
+    await rm(stateDirectory, { recursive: true, force: true });
+  });
+
+  function seedLabels(extra, role = 'seed') {
+    return providerLabels({
+      provider: 'kubernetes',
+      providerResourceID: extra.providerResourceID,
+      projectID: extra.projectID,
+      controlPlaneWorkspaceID: extra.controlPlaneWorkspaceID,
+      originalControlPlaneWorkspaceID: extra.originalControlPlaneWorkspaceID ?? extra.controlPlaneWorkspaceID,
+    }, role);
+  }
+
+  it('removes the seed pod an interrupted create left behind, before the PVCs it holds', async () => {
+    // A completed create deletes its seed pod, so cleanup never used to look for it.
+    // An interrupted create leaves it mounted on both PVCs, whose protection finalizer
+    // then waits on the pod: each PVC delete times out and cleanup reports incomplete
+    // forever. Remove must delete the leftover pod first, ownership-verified.
+    const currentPolicy = policy();
+    const provider = createKubernetesProvider({ policy: currentPolicy, sourceDirectory: '/source' });
+    const info = provider.configure({ id: 'control-id', projectID: 'project-id' });
+    const refs = info.extra.resourceRefs;
+    const seedPod = `${refs.deployment}-seed`;
+    processMocks.run.mockImplementation(async (_binary, args) => {
+      if (args.includes('get') && args.includes('pod') && args.includes(seedPod)) {
+        return { stdout: JSON.stringify({ metadata: { labels: seedLabels(info.extra) } }), stderr: '' };
+      }
+      if (args.includes('get')) throw new Error('Error from server (NotFound): resource not found');
+      return { stdout: '', stderr: '' };
+    });
+
+    const result = await provider.remove(info);
+
+    const commands = processMocks.run.mock.calls.map(([, args]) => args);
+    const podDelete = commands.findIndex((args) => args.includes('delete') && args.includes('pod') && args.includes(seedPod));
+    const pvcDelete = commands.findIndex((args) => args.includes('delete') && args.includes('pvc'));
+    expect(podDelete).toBeGreaterThanOrEqual(0);
+    expect(pvcDelete).toBeGreaterThan(podDelete);
+    expect(result.remainingResources ?? []).toEqual([]);
+  });
+
+  it('refuses a foreign pod wearing the seed name instead of deleting it', async () => {
+    const currentPolicy = policy();
+    const provider = createKubernetesProvider({ policy: currentPolicy, sourceDirectory: '/source' });
+    const info = provider.configure({ id: 'control-id', projectID: 'project-id' });
+    const refs = info.extra.resourceRefs;
+    const seedPod = `${refs.deployment}-seed`;
+    processMocks.run.mockImplementation(async (_binary, args) => {
+      if (args.includes('get') && args.includes('pod') && args.includes(seedPod)) {
+        return { stdout: JSON.stringify({ metadata: { labels: { ...seedLabels(info.extra), 'openchamber.io/resource-id': 'ws-foreign' } } }), stderr: '' };
+      }
+      if (args.includes('get')) throw new Error('Error from server (NotFound): resource not found');
+      return { stdout: '', stderr: '' };
+    });
+
+    await expect(provider.remove(info)).rejects.toMatchObject({
+      remainingResources: expect.arrayContaining([`pod:${seedPod}`]),
+    });
+
+    const commands = processMocks.run.mock.calls.map(([, args]) => args);
+    expect(commands.some((args) => args.includes('delete') && args.includes('pod') && args.includes(seedPod))).toBe(false);
+  });
+});
+
