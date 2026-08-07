@@ -9,6 +9,7 @@ import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHa
 import { createWorkspaceSecrets, getWorkspaceToken, rotateWorkspaceCredentials, selectGrantedCredentials } from '../auth.js';
 import { requireKubernetesEgress, validateGatewayImage, validateImage } from '../policy.js';
 import { grantedEgressPolicy } from '../egress-domains.js';
+import { parseAuthCanIList, permissionsNeedingProbe } from './rbac-listing.js';
 import { waitForHttpHealth } from '../health.js';
 import { KUBERNETES_TOKEN_FILE, KUBERNETES_TOKEN_MOUNT_PATH, PROVIDER_MODEL_AUTH_FILE, runtimeCommand, runtimeEnvironment } from '../runtime-command.js';
 import { cleanupTransaction, createTransaction } from '../lifecycle.js';
@@ -47,10 +48,16 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
       }
       throw new ProviderUnavailableError(`Kubernetes cluster is not reachable: ${cause instanceof Error ? cause.message : String(cause)}`, { provider, code: 'WORKSPACE_PROVIDER_CLUSTER_UNREACHABLE', cause });
     });
-    // Each check is a process spawn and a round trip, and there are two dozen of them:
-    // run sequentially they dominated the time to display readiness. Every denial is
+    // Every check is a process spawn, and two dozen of them cost seconds on Windows —
+    // creating the processes, not the round trips, which is why raising the concurrency
+    // did not help. One listing answers for all of them at the price of one, and whatever
+    // it does not clearly settle is still asked about directly below. Every denial is
     // collected rather than only the first, so one message names everything to request.
-    const denied = await mapWithConcurrency(requiredPermissions(policy), RBAC_PROBE_CONCURRENCY, async ([verb, resource]) => {
+    const listing = await kubectl(['auth', 'can-i', '--list', '-n', policy.kubernetes.namespace], { timeoutMs: 20_000 })
+      .then((result) => parseAuthCanIList(result.stdout))
+      .catch(() => []);
+    const unsettled = permissionsNeedingProbe(listing, requiredPermissions(policy));
+    const denied = await mapWithConcurrency(unsettled, RBAC_PROBE_CONCURRENCY, async ([verb, resource]) => {
       const { stdout } = await kubectl(['auth', 'can-i', verb, resource, '-n', policy.kubernetes.namespace], { timeoutMs: 20_000 });
       return stdout.trim() === 'yes' ? null : `${verb} ${resource}`;
     });
