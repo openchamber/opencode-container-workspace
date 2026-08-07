@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { StateStoreError } from './errors.js';
+import { protectDirectoryForCurrentUser } from './windows-acl.js';
 
 const LOCK_STALE_MS = 5 * 60_000;
 const LOCK_WAIT_MS = 30_000;
@@ -123,6 +124,13 @@ export async function atomicWrite(path, content) {
 }
 
 async function secureDirectory(path) {
+  const root = stateRoot();
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  await chmod(root, 0o700);
+  // Windows accepts both of the above and honours neither. The root carries an
+  // inheritable ACL instead, so every directory and file created below it is restricted
+  // without a call of its own.
+  await protectDirectoryForCurrentUser(root);
   await mkdir(path, { recursive: true, mode: 0o700 });
   await chmod(path, 0o700);
 }
