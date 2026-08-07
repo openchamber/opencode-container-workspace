@@ -27,7 +27,12 @@ describe('structured export artifacts', () => {
     await writeFile(join(workspace, 'binary'), Buffer.from([0, 255, 1]));
     try {
       const snapshot = await runJson(process.execPath, ['-e', RUNTIME_ARTIFACT_SCRIPT, baseline, workspace, 'generation', '1048576', '1048576', '10485760'], { sensitiveValues: [RUNTIME_ARTIFACT_SCRIPT] });
-      expect(snapshot.files.map((file) => file.kind)).toEqual(expect.arrayContaining(['rename', 'mode', 'modify', 'delete', 'add']));
+      // A mode change can only be detected where modes change. Windows reports the same
+      // mode before and after `chmod`, so the operation legitimately does not appear.
+      const expectedKinds = process.platform === 'win32'
+        ? ['rename', 'modify', 'delete', 'add']
+        : ['rename', 'mode', 'modify', 'delete', 'add'];
+      expect(snapshot.files.map((file) => file.kind)).toEqual(expect.arrayContaining(expectedKinds));
       expect(snapshot.files.find((file) => file.newPath === 'binary')).toMatchObject({ binary: true, kind: 'add' });
       expect(snapshot.files.find((file) => file.newPath === 'link')).toMatchObject({ symlinkTarget: 'new' });
       expect(snapshot.files.find((file) => file.newPath === 'modify').textHunks).toHaveLength(1);

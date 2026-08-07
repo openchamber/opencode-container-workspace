@@ -21,9 +21,17 @@ describe('workspace state store', () => {
     await writeWorkspaceSecret(id, 'endpoint-token', 'secret');
     expect(await readWorkspaceState(id)).toMatchObject({ lifecycle: 'ready' });
     expect(await readWorkspaceSecret(id, 'endpoint-token')).toBe('secret');
-    expect((await stat(workspaceStateDirectory(id))).mode & 0o777).toBe(0o700);
-    expect((await stat(join(workspaceStateDirectory(id), 'state.json'))).mode & 0o777).toBe(0o600);
-    expect((await stat(join(workspaceStateDirectory(id), 'secrets', 'endpoint-token'))).mode & 0o777).toBe(0o600);
+    // POSIX modes are how this store restricts its state and secrets, and Windows does
+    // not implement them: `chmod` is close to a no-op there and every file reports 0o666.
+    // Asserting the modes on Windows would only restate that, so the check is skipped —
+    // but the protection genuinely is absent there, standing only on ACLs inherited from
+    // wherever the data directory happens to live. Enforcing it explicitly on Windows is
+    // outstanding work, not a platform difference that can be waved through.
+    if (process.platform !== 'win32') {
+      expect((await stat(workspaceStateDirectory(id))).mode & 0o777).toBe(0o700);
+      expect((await stat(join(workspaceStateDirectory(id), 'state.json'))).mode & 0o777).toBe(0o600);
+      expect((await stat(join(workspaceStateDirectory(id), 'secrets', 'endpoint-token'))).mode & 0o777).toBe(0o600);
+    }
   });
 
   it('reports corrupt state instead of treating it as empty', async () => {
