@@ -2,11 +2,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ProcessError } from '../errors.js';
 
 const processMocks = vi.hoisted(() => ({ commandExists: vi.fn(() => true), run: vi.fn(), runJson: vi.fn() }));
 vi.mock('../process.js', async (importOriginal) => ({ ...await importOriginal(), ...processMocks }));
 const { readPolicy } = await import('../policy.js');
 const { createDockerProvider } = await import('./docker.js');
+
+const dockerExitError = (stderr, options = {}) => new ProcessError(`docker failed with ${options.exitCode ?? 1}: ${stderr}`, {
+  kind: options.kind ?? 'exit',
+  exitCode: options.exitCode ?? 1,
+  stderr,
+  truncated: options.truncated ?? false,
+});
 
 describe('Docker provider security and transactions', () => {
   let stateDirectory;
@@ -15,7 +23,7 @@ describe('Docker provider security and transactions', () => {
     process.env.OPENCHAMBER_WORKSPACE_STATE_DIR = stateDirectory;
     processMocks.commandExists.mockReturnValue(true);
     processMocks.run.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
-    processMocks.runJson.mockReset().mockRejectedValue(new Error('not found'));
+    processMocks.runJson.mockReset().mockRejectedValue(dockerExitError('Error: No such object: workspace-resource'));
   });
   afterEach(async () => {
     delete process.env.OPENCHAMBER_WORKSPACE_STATE_DIR;
@@ -68,6 +76,39 @@ describe('Docker provider security and transactions', () => {
     expect(JSON.stringify(commands)).not.toContain('OPENCODE_AUTH_CONTENT=');
   });
 
+  it('treats Docker 20.10 missing-network diagnostics as authoritative absence', async () => {
+    const sourceDirectory = join(stateDirectory, 'source');
+    await mkdir(sourceDirectory);
+    const { provider, info } = configured(sourceDirectory);
+    processMocks.runJson.mockImplementation(async (_binary, args) => {
+      if (args[0] === 'network') throw dockerExitError(`Error: No such network: ${args.at(-1)}`);
+      if (args[0] === 'volume') throw dockerExitError(`Error: No such volume: ${args.at(-1)}`);
+      throw dockerExitError(`Error: No such object: ${args.at(-1)}`);
+    });
+    processMocks.run.mockImplementation(async (_binary, args) => {
+      if (args[0] === 'network' && args[1] === 'create') throw new Error('network creation reached');
+      return { stdout: '', stderr: '' };
+    });
+
+    await expect(provider.create(info)).rejects.toThrow('network creation reached');
+    expect(processMocks.run).toHaveBeenCalledWith('docker', expect.arrayContaining(['network', 'create', info.extra.resourceRefs.network]), expect.any(Object));
+  });
+
+  it.each([
+    ['plain errors', new Error('network not found')],
+    ['timeouts', dockerExitError('network not found', { kind: 'timeout', exitCode: null })],
+    ['unrelated daemon failures', dockerExitError('permission denied')],
+    ['truncated diagnostics', dockerExitError('Error: No such network: workspace-resource', { truncated: true })],
+  ])('does not treat %s as authoritative Docker absence', async (_label, failure) => {
+    const sourceDirectory = join(stateDirectory, 'source');
+    await mkdir(sourceDirectory);
+    const { provider, info } = configured(sourceDirectory);
+    processMocks.runJson.mockRejectedValue(failure);
+
+    await expect(provider.create(info)).rejects.toBe(failure);
+    expect(processMocks.run.mock.calls.some(([, args]) => args[0] === 'network' && args[1] === 'create')).toBe(false);
+  });
+
   it('runs short-lived seed helpers as the unprivileged runtime user', async () => {
     const sourceDirectory = join(stateDirectory, 'source');
     await mkdir(sourceDirectory);
@@ -101,7 +142,7 @@ describe('Docker provider security and transactions', () => {
     await mkdir(sourceDirectory);
     const { provider, info } = configuredWithProxy('https://proxy.example.com:8443', sourceDirectory);
 
-    await expect(provider.create(info)).rejects.toThrow(/not found/);
+    await expect(provider.create(info)).rejects.toThrow(/No such object/);
     const gateway = processMocks.run.mock.calls.map(([, args]) => args).find((args) => args.includes(info.extra.resourceRefs.gateway) && args.includes('OPENCHAMBER_PROXY_TLS=true'));
     expect(gateway).toEqual(expect.arrayContaining([
       'OPENCHAMBER_PROXY_HOST=proxy.example.com', 'OPENCHAMBER_PROXY_PORT=8443',
