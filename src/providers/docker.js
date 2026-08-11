@@ -1,6 +1,6 @@
 import { createServer } from 'node:net';
 import { commandExists, run, runJson } from '../process.js';
-import { ProviderUnavailableError, OwnershipError } from '../errors.js';
+import { ProcessError, ProviderUnavailableError, OwnershipError } from '../errors.js';
 import { canonicalResourceRefs, createMetadata, deriveWorkspaceIdentity, labelHash, providerLabels, readCleanupMetadata, readMetadata, workspaceName, WORKSPACE_RUNTIME } from '../metadata.js';
 import { createWorkspaceSecrets, getWorkspaceToken, rotateWorkspaceCredentials, selectGrantedCredentials } from '../auth.js';
 import { requireDockerEgress, validateImage } from '../policy.js';
@@ -420,5 +420,12 @@ function readDockerLabel(labels, key) {
 }
 
 function isDockerNotFound(error) {
-  return /No such object|No such container|No such volume|not found/i.test(error instanceof Error ? error.message : String(error));
+  if (!(error instanceof ProcessError)
+    || error.kind !== 'exit'
+    || !Number.isInteger(error.exitCode)
+    || error.exitCode === 0
+    || error.truncated) return false;
+  const output = `${error.stderr}\n${error.stdout}`;
+  return /\bNo such (?:object|container|volume|network):/i.test(output)
+    || /\b(?:container|volume|network)\b.*\bnot found\b/i.test(output);
 }
