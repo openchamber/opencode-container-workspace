@@ -410,6 +410,6 @@ function isDockerNotFound(error) {
     || error.exitCode === 0
     || error.truncated) return false;
   const output = `${error.stderr}\n${error.stdout}`;
-  return /\bNo such (?:object|container|volume|network):/i.test(output)
+  return /\bNo such (?:object|container|volume|network)\b/i.test(output)
     || /\b(?:container|volume|network)\b.*\bnot found\b/i.test(output);
 }

@@ -94,6 +94,18 @@ describe('Docker provider security and transactions', () => {
     expect(processMocks.run).toHaveBeenCalledWith('docker', expect.arrayContaining(['network', 'create', info.extra.resourceRefs.network]), expect.any(Object));
   });
 
+  it('treats current Docker missing-volume diagnostics as idempotent cleanup', async () => {
+    const { provider, info } = configured();
+    processMocks.run.mockImplementation(async (_binary, args) => {
+      if (args[0] === 'volume' && args[1] === 'rm') {
+        throw dockerExitError(`Error response from daemon: get ${args.at(-1)}: no such volume`);
+      }
+      return { stdout: '', stderr: '' };
+    });
+
+    await expect(provider.remove(info)).resolves.toMatchObject({ ok: true, remainingResources: [] });
+  });
+
   it.each([
     ['plain errors', new Error('network not found')],
     ['timeouts', dockerExitError('network not found', { kind: 'timeout', exitCode: null })],
