@@ -84,7 +84,6 @@ export function requireDockerEgress(policy) {
 }
 
 export function requireKubernetesEgress(policy) {
-  if (policy.egress.dnsCIDRs.length === 0) throw new PolicyError('Kubernetes egress requires egress.dnsCIDRs for controlled DNS');
   for (const cidr of policy.egress.dnsCIDRs) validateCIDR(cidr, 'Workspace egress DNS CIDR');
   if (policy.egress.mode === 'managed') {
     validateGatewayImage(policy.egress.gatewayImage);

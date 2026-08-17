@@ -47,10 +47,10 @@ describe('workspace policy', () => {
     expect(() => requireDockerEgress(readPolicy({ egress: { mode: 'external', proxyUrl: 'http://proxy.openchamber:3128' } }))).not.toThrow();
   });
 
-  it('requires explicit Kubernetes proxy and DNS egress for default-deny policy', () => {
+  it('requires an explicit Kubernetes proxy but accepts selector-scoped DNS without a CIDR', () => {
     expect(() => requireKubernetesEgress(readPolicy())).toThrow(/egress/i);
     expect(() => requireKubernetesEgress(readPolicy({
-      egress: { mode: 'external', proxyUrl: 'http://10.0.0.10:3128', proxyCIDR: '10.0.0.10/32', dnsCIDRs: ['10.0.0.53/32'] },
+      egress: { mode: 'external', proxyUrl: 'http://10.0.0.10:3128', proxyCIDR: '10.0.0.10/32' },
     }))).not.toThrow();
   });
 
