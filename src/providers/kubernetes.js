@@ -20,10 +20,12 @@ export const KUBERNETES_SEED_EXTRACT_COMMAND = `set -eu; cat > /tmp/source.tar; 
 export function createKubernetesProvider({ policy, sourceDirectory }) {
   const provider = 'kubernetes';
   const kubectl = (args, options = {}) => run('kubectl', [...contextArgs(policy), ...args], options);
+  let resolvedDnsCIDRs = policy.egress.dnsCIDRs;
 
   async function preflight() {
     requireKubernetesEgress(policy);
     await kubectl(['version', '--client=true'], { timeoutMs: 15_000 }).catch((cause) => { throw new ProviderUnavailableError('kubectl is not available', { provider, cause }); });
+    resolvedDnsCIDRs = await resolveDnsCIDRs(kubectl, policy.egress.dnsCIDRs);
     await kubectl(['get', 'namespace', policy.kubernetes.namespace, '-o', 'name'], { timeoutMs: 20_000 });
     for (const [verb, resource] of requiredPermissions(policy)) {
       const { stdout } = await kubectl(['auth', 'can-i', verb, resource, '-n', policy.kubernetes.namespace], { timeoutMs: 20_000 });
@@ -65,7 +67,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
       const secrets = await createWorkspaceSecrets(meta.providerResourceID, grantedCredentials);
       const hostPort = await availableStablePort(meta.providerResourceID);
       await transaction.update({ hostPort, imageDigest: image });
-      const manifests = buildManifests({ identity, refs, image, policy, token: secrets.token, modelAuth: secrets.modelAuth });
+      const manifests = buildManifests({ identity, refs, image, policy: { ...policy, egress: { ...policy.egress, dnsCIDRs: resolvedDnsCIDRs } }, token: secrets.token, modelAuth: secrets.modelAuth });
       for (const manifest of manifests.infrastructure) {
         const resource = `${manifest.kind.toLowerCase()}:${manifest.metadata.name}`;
         await transaction.create(resource, () => createManifest(kubectl, manifest), async () => {
@@ -292,6 +294,16 @@ function dnsEgress(cidrs) {
     ...cidrs.map((cidr) => ({ to: [{ ipBlock: { cidr } }], ports })),
     { to: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' } }, podSelector: { matchLabels: { 'k8s-app': 'kube-dns' } } }], ports },
   ];
+}
+
+async function resolveDnsCIDRs(kubectl, configuredCIDRs) {
+  if (configuredCIDRs.length > 0) return configuredCIDRs;
+  const { stdout } = await kubectl(['get', 'service', '-n', 'kube-system', '-l', 'k8s-app=kube-dns', '-o', 'json'], { timeoutMs: 20_000 });
+  const addresses = (JSON.parse(stdout).items ?? [])
+    .flatMap((service) => service.spec?.clusterIPs ?? [service.spec?.clusterIP])
+    .filter((address) => typeof address === 'string' && address !== 'None');
+  if (addresses.length === 0) throw new ProviderUnavailableError('Kubernetes DNS service address is unavailable; grant read access to kube-system Services or configure a DNS CIDR', { provider: 'kubernetes' });
+  return [...new Set(addresses.map((address) => address.includes(':') ? `${address}/128` : `${address}/32`))];
 }
 
 function buildRuntimeIngress(policy) {
