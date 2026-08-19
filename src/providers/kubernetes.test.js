@@ -199,5 +199,37 @@ describe('Kubernetes provider cleanup', () => {
     const commands = processMocks.run.mock.calls.map(([, args]) => args);
     expect(commands.some((args) => args.includes('delete') && args.includes('pod') && args.includes(seedPod))).toBe(false);
   });
-});
 
+  it('does not report successful cleanup while canonical resources remain', async () => {
+    const currentPolicy = policy();
+    const provider = createKubernetesProvider({ policy: currentPolicy, sourceDirectory: '/source' });
+    const info = provider.configure({ id: 'control-id', projectID: 'project-id' });
+    const refs = info.extra.resourceRefs;
+    const resources = [
+      ['deployment', refs.deployment, 'runtime'],
+      ['service', refs.service, 'service'],
+      ['secret', refs.secret, 'secrets'],
+      ['serviceaccount', refs.serviceAccount, 'service-account'],
+      ['pvc', refs.mutablePVC, 'mutable-storage'],
+      ['pvc', refs.baselinePVC, 'baseline-storage'],
+      ['networkpolicy', refs.networkPolicy, 'network-policy'],
+      ['networkpolicy', refs.seedNetworkPolicy, 'seed-network-policy'],
+    ];
+    let deleteSucceeded = false;
+    processMocks.run.mockImplementation(async (_binary, args) => {
+      if (args.includes('delete')) {
+        deleteSucceeded = true;
+        return { stdout: '', stderr: '' };
+      }
+      if (args.includes('get')) {
+        const resource = resources.find(([kind, name]) => args.includes(kind) && args.includes(name));
+        if (resource) {
+          return { stdout: JSON.stringify({ metadata: { labels: seedLabels(info.extra, resource[2]) } }), stderr: '' };
+        }
+      }
+      throw new Error('Error from server (NotFound): resource not found');
+    });
+
+    await expect(provider.remove(info)).rejects.toThrow('Kubernetes resource collision');
+  });
+});

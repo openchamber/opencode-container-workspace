@@ -284,6 +284,7 @@ export function createKubernetesProvider({ policy, sourceDirectory }) {
         cleanup.retain(`pvc:${refs.mutablePVC}`);
         cleanup.retain(`pvc:${refs.baselinePVC}`);
       }
+      await assertResourcesAbsent(kubectl, refs);
     });
     return { ...result, diagnostics: [...diagnostics, ...(result.diagnostics ?? [])] };
   }
